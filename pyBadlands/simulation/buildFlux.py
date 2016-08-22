@@ -17,7 +17,7 @@ import mpi4py.MPI as mpi
 from pyBadlands import (elevationTIN)
 
 def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
-                 lGIDs, rain, tNow, verbose=False):
+                 lGIDs, rain, tNow, verbose=False, model=None):
     """
     Compute flow network.
     """
@@ -44,9 +44,10 @@ def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
         # fillH = elevationTIN.pit_filling_PD(elevation, FVmesh.neighbours,
         #                            recGrid.boundsPt, force.sealevel-input.sealimit
         #                            input.fillmax)
-        sea_lvl =  force.sealevel - input.sealimit
-        fillH = elevationTIN.pit_stack_PD(elevation,sea_lvl)
+        sea_lvl = force.sealevel - input.sealimit
 
+        fillH = elevationTIN.pit_priority_flood(elev=elevation, sea=sea_lvl,
+                neighbours=FVmesh.neighbours, boundPts=recGrid.boundsPt, fillTH=input.fillmax)
     if rank == 0 and verbose and input.spl and not input.filter:
         print " -   depression-less algorithm PD with stack", time.clock() - walltime
 

@@ -253,7 +253,7 @@ class Model(object):
 
             # Compute stream network
             self.fillH = buildFlux.streamflow(self.input, self.FVmesh, self.recGrid, self.force, self.hillslope, \
-                                              self.flow, self.elevation, self.lGIDs, self.rain, self.tNow, verbose)
+                                              self.flow, self.elevation, self.lGIDs, self.rain, self.tNow, verbose, model=self)
             # Compute isostatic flexure
             if self.tNow >= self.force.next_flexure:
                 flextime = time.clock()
