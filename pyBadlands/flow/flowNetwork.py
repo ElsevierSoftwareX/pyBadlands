@@ -552,3 +552,115 @@ class flowNetwork:
         CFL[0] = dt
         comm.Allreduce(mpi.IN_PLACE,CFL,op=mpi.MIN)
         self.CFL = CFL[0]
+
+    def sedflux_nocapacity_proposal(self, elev, xymin, xymax, dt, sea, areas, fillH, diff_flux):
+        '''
+        Returns sedflux, newdt
+        '''
+
+        newdt = dt
+        change = numpy.empty_like(elev)
+        change.fill(-1.e6)
+
+        sedFluxes = numpy.zeros_like(elev)
+
+        # for each node in RANDOM ORDER, we iterate over FLOWS from donor to receiver
+        print 'there are %s nodes' % len(self.localstack)
+        for stack_index in range(len(self.localstack) - 1, -1, -1):
+            # print 'index %s' % stack_index
+            SPL = 0.
+            donor = self.stack[stack_index]  # get our CURRENT NODE INDEX
+            recvr = self.receivers[donor]  # get the corresponding RECEIVER NODE INDEX
+            dh = 0.95 * (elev[donor] - elev[recvr])
+
+            if elev[donor] > sea and elev[recvr] < sea:
+                dh = elev[donor] - sea
+
+            if dh < 0.001:
+                dh = 0.
+            waterH = fillH[donor] - elev[donor]
+
+            # Compute stream power law
+            if recvr != donor and dh > 0.:
+                if waterH == 0. and elev[donor] >= sea:
+                    dist = math.sqrt((self.xycoords[donor, 0] - self.xycoords[recvr, 0]) ** 2.0 + (self.xycoords[donor, 1] - self.xycoords[recvr, 1]) ** 2.0)
+                    if dist > 0.:
+                        SPL = -self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
+
+            maxh = self.maxh[donor]
+            if elev[donor] < sea:
+                maxh = sea - elev[donor]
+            elif waterH > 0.:
+                maxh = min(waterH, maxh)
+
+            maxh *= 0.95
+            Qs = 0.
+
+            # Deposition case
+            if SPL == 0. and areas[donor] > 0.:  # if no stream power AND donor has finite drainage area ??? what does this mean?
+                if maxh > 0. and elev[donor] < sea:  # if there's water AND we are under the sea - *** this sounds like an obscure case
+                    if sedFluxes[donor] * newdt / areas[donor] < maxh:  # will the sediment deposition stay under the water/sea level?
+                        SPL = sedFluxes[donor] / areas[donor]  # set new stream power (?) what does this mean? 
+                        Qs = 0.  # no new flow on this node
+                    else:
+                        SPL = maxh / newdt  # maximum SPL?
+                        Qs = sedFluxes[donor] - SPL * areas[donor]  # maximum flow/deposition on receiver?
+
+                # Fill depression
+                elif waterH > 0.0001 and donor != recvr:  # if there is water AND flow is between two different nodes
+                    dh = 0.95 * waterH
+                    if sedFluxes[donor] * newdt / areas[donor] < dh:  # if deposition stays under water level
+                        SPL = sedFluxes[donor] / areas[donor]  # stream power is determined by ???
+                        Qs = 0.  # no new flow on receiver
+                    else:
+                        # same as above - use maximum flow
+                        SPL = dh / newdt
+                        Qs = sedFluxes[donor] - SPL * areas[donor]
+
+                # Base-level (sink)
+                elif donor == recvr and areas[donor] > 0.:  # if this is a sink
+                    SPL = sedFluxes[donor] / areas[donor]
+                    Qs = 0.
+                else:
+                    Qs = sedFluxes[donor]
+
+            # Erosion case
+            elif SPL < 0.:  # if we are ERODING i.e. negative power (?)
+                if elev[donor] > sea and elev[recvr] < sea:  # if donor is above the sea and receiver is under the sea
+                    # print *, "case A", newdt, mtime
+                    newdt = min(newdt, -0.99 * (elev[donor] - sea) / SPL)  # dt is limited because we don't want to reverse gradient (?)
+
+                if -SPL * newdt > elev[donor] - elev[recvr]:  # dt is limited because we don't want to reverse gradient (?)
+                    # print *, "case B", newdt, mtime
+                    newdt = min(newdt, -0.99 * (elev[donor] - elev[recvr]) / SPL)
+
+                Qs = -SPL * areas[donor] + sedFluxes[donor]  # receiver gets additional deposit depending on spl/area of donor and all sediment on donor
+
+            # Update sediment flux in receiver node
+            sedFluxes[recvr] += Qs  # receiver gets more sediment
+            # print 'apply %s to %s which now has %s' % (Qs, recvr, sedFluxes[recvr])
+            change[donor] = SPL + diff_flux[donor]  # set donor spl (happens once per donor)
+
+            # Update borders
+            if self.xycoords[donor, 0] < xymin[0] or self.xycoords[donor, 1] < xymin[1] or self.xycoords[donor, 0] > xymax[0] or self.xycoords[donor, 1] > xymax[1]:
+                change[donor] = 0.
+
+            # Update base levels
+            if donor == recvr and change[donor] > 0.:  # this is a sink node AND pyChange is set
+                if waterH == 0.:  # no water
+                    mtime = self.maxdep[donor] / change[donor]  # pymaxd is depth of flow (difference in height from donor to receiver). TODO what is pychange?
+                    # i guess pychange is rate of change - maxdepth / rate of change = max years - don't fill past level?
+                    # this determines mtime (maxtime)
+                    # this MIGHT BE the main constraint *********
+                    # print *, "case C", newdt, mtime
+                    newdt = min(newdt, mtime)
+                else:
+                    mtime = waterH / change[donor]  # pymaxd
+                    # this is WATER case
+                    # don't fill past water?
+                    # THIS IS THE MAIN CONSTRAINT. The other cases are not touched!
+                    print "case D, node %s %s %s" % (newdt, mtime, donor)
+                    newdt = min(newdt, mtime)
+
+        # return sedFluxes, newdt
+        return change, newdt
