@@ -277,12 +277,9 @@ class flowNetwork:
 
         # Using libUtils stack create the ordered node array
         self.donors,lstcks = FLWnetwork.fstack.build(self.localbase,self.receivers,self.delta)
-
         # Create local stack
         stids = numpy.where(lstcks > -1 )[0]
         self.localstack = lstcks[stids]
-
-        return
 
     def compute_flow(self, Acell, rain):
         """
@@ -333,7 +330,7 @@ class flowNetwork:
 
         return
 
-    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, sealevel, cumdiff):
+    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, sealevel, cumdiff, neighbours=None):
         """
         Calculates the sediment flux at each node.
 
@@ -441,7 +438,7 @@ class flowNetwork:
             newdt = max(self.mindt,newdt)
             sedrate = sedflux
 
-        return newdt,sedrate
+        return newdt,sedrate,diff
 
     def gaussian_filter(self, diff):
         """
@@ -664,3 +661,481 @@ class flowNetwork:
 
         # return sedFluxes, newdt
         return change, newdt
+
+    def _volume_of_nodes(self, areas, node_id_set, limit_elev, elev):
+        """
+        Returns the volume of the nodes specified in node_id_set up to the
+        limit elevation.
+        """
+
+        volume = 0.0
+        for nid in node_id_set:
+            volume += areas[nid] * abs(limit_elev - elev[nid])
+
+        return volume
+
+    def _pop_lowest_node(self, elev, unvisited_ids):
+        """
+        Determine which node from unvisited_ids is lowest, remove it from
+        unvisited_ids and return it.
+        """
+        id_array = numpy.array(list(unvisited_ids))
+        unvisited_elevs = elev[id_array]
+        lowest_index = numpy.argmin(unvisited_elevs)
+        lowest_id = id_array[lowest_index]
+        unvisited_ids.remove(lowest_id)
+        return lowest_id
+
+    def _get_pythonic_neighbours(self, nid, neighbours):
+        """
+        Returns an iterable list of neighbour nodes to 'nid'.
+
+        This is useful because the format used for the FORTRAN code is
+        difficult to manipulate from Python code.
+        """
+        neigh = neighbours[nid]
+        return neigh[neigh >= 0]
+
+    def _catchment_capacity(self, sink_id, elev, max_volume_needed, areas, neighbours):
+        """
+        Determine the catchment volume and sill node for the catchment
+        originating at a given sink node.
+
+        Returns (volume, sill_node_id)
+        """
+        volume = 0.0
+        sill_node_id = None
+        sill_node_elev = None
+
+        # TODO: obviously, some prioqueues are going to make this a lot faster
+        nodes_in_catchment = set([sink_id])
+        visited_nodes = set()
+        unvisited_nodes = set([sink_id])
+
+        while len(unvisited_nodes) and volume < max_volume_needed and sill_node_id is None:
+            lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_nodes)
+            visited_nodes.add(lowest_id)
+            lowest_elev = elev[lowest_id]
+
+            # NOTE: this scales O(N^2) with node count. There are definitely more efficient algorithms!
+            volume = self._volume_of_nodes(areas, nodes_in_catchment, lowest_elev, elev)
+            if not(volume > 0.0 or len(nodes_in_catchment) == 1):
+                import pdb; pdb.set_trace()
+            assert volume > 0.0 or len(nodes_in_catchment) == 1
+
+            # does it drain into the same catchment?
+            if self.receivers[lowest_id] in nodes_in_catchment:
+                nodes_in_catchment.add(lowest_id)
+                assert lowest_id not in unvisited_nodes
+                # print 'readd %s' % lowest_id
+                if lowest_id not in visited_nodes:
+                    unvisited_nodes.add(lowest_id)
+
+                # add any neighbours to our 'unvisited' list
+                for nid in self._get_pythonic_neighbours(lowest_id, neighbours):
+                    if nid not in visited_nodes:
+                        unvisited_nodes.add(nid)
+
+            elif sill_node_id is None or lowest_elev < sill_node_elev:  # It drains elsewhere. Could it be our sill node?
+                sill_node_id = lowest_id
+                sill_node_elev = lowest_elev
+
+        return volume, sill_node_id
+
+    def _resolve_sink(self, sinks, nid):
+        """
+        For a given node id 'nid', figure out its sink node id. Update 'sinks'
+        and return the resolved sink node id.
+
+        Updates 'sinks' in-place.
+
+        Returns the sink node id.
+        """
+        assert nid >= 0
+
+        if sinks[nid] >= 0:
+            return sinks[nid]
+
+        # what's the receiver?
+        recvr = self.receivers[nid]
+        if recvr == nid:  # sink node
+            sinks[nid] = nid
+        else:
+            # recursively call to find recvr's sink
+            sinks[nid] = self._resolve_sink(sinks, recvr)
+
+        assert sinks[nid] >= 0
+        return sinks[nid]
+
+    def _distribute_sediment(self, sink_id, elev, sill_id, deposition_change, rate, dt, sinks, areas, neighbours):
+        """
+        For a given node is 'sink_id' and its deposition rate 'rate', determine
+        how to distribute the sediment volume within the catchment.
+
+        Modifies 'deposition_change' in-place.
+
+        elev is the elevation of each node including any erosion.
+
+        Discards any excess sediment that does not fit within the catchment.
+        """
+
+        # Strategy:
+        #
+        # Starting from the lowest node and working our way up to the highest
+        # within the catchment (bounded by the sill), we raise one node at a
+        # time to the elevation of the next highest (minus epsilon, to ensure
+        # we still have the same sink and slope characteristics after filling).
+        # Each time we raise a node, we recalculate the volume consumed by the
+        # newly raised catchment. All nodes that have been raised are raised at
+        # the same time.
+        #
+        # IF we have consumed less than the requisite volume of sediment, we
+        # raise the next-lowest node.
+        # IF we have consumed more than enough sediment, we lower all of the
+        # touched nodes by a small amount so as to consume exactly the right
+        # amount of sediment.
+        # IF we run out of nodes to raise and there is still sediment
+        # remaining, we 'top off' the catchment so as to eliminate the
+        # depression/sink in it. We then FOR THIS VERSION OF THE ALGORITHM ONLY
+        # discard any excess sediment.
+
+        raised_ids = set()  # nodes which have been raised to perform this deposition
+        # touched_ids = set()
+        visited_ids = set([sink_id])
+        unvisited_ids = set([sink_id])
+        deposition_amount = rate * dt
+
+        volume = 0.0  # volume of sediment that we have distributed
+
+        while len(unvisited_ids) and volume < deposition_amount:
+            # again, prioqueues would help here
+            lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_ids)
+            lowest_elev = elev[lowest_id]
+
+            # add any potential neighbours to our 'unvisited' list
+            # this guarantees that the next-lowest node in the catchment is available to be visited
+            for nid in self._get_pythonic_neighbours(lowest_id, neighbours):
+                if nid not in visited_ids:
+                    visited_ids.add(nid)
+                    if self._resolve_sink(sinks, nid) == sink_id:
+                        unvisited_ids.add(nid)
+
+            # NOTE: this scales O(N^2) with node count. There are definitely more efficient algorithms!
+            volume = self._volume_of_nodes(areas, raised_ids, lowest_elev, elev)
+
+            raised_ids.add(lowest_id)
+
+        if len(unvisited_ids) == 0:
+            # we ran out of nodes to raise
+            print 'DISCARDING SEDIMENT volume %s on top of %s' % (deposition_amount - volume, volume)
+        elif volume > deposition_amount:
+            # scale back the last amount of deposition
+            # NOT IMPLEMENTED
+            print 'TAKING A SHORTCUT we have excess deposition (total = %s, allocated = %s, sink_id = %s)' % (deposition_amount, volume, sink_id)
+        # else, we did not fill the catchment
+
+        # work out how to fill the nodes
+        # we go from highest to lowest and assign them all to the elevation of the highest, minus epsilon. This maintains the same drainage structure.
+        # NOTE: there is a slight error in the resulting volume calculation; we will log it for now and try to improve it later.
+        # NOTE: we haven't yet handled the case where the next iteration will try to fill these same nodes as we haven't truly filled the depression.
+
+        # pull the raised ids into a list so we can sort them descending by elevation
+        raised_ids_array = numpy.array(list(raised_ids))
+        raised_ids_elevs = elev[raised_ids_array]
+        # sort
+        descending_elev_nodes = raised_ids_array[numpy.argsort(raised_ids_elevs)[::-1]]
+        highest_elev = elev[descending_elev_nodes[0]]
+
+        # work out how much to change their deposition amount by
+        # we want to raise them all to (highest_elev - count * epsilon)
+        epsilon = 0.00001  # NOTE: we could use next_after, but that is likely to lead to numerical stability issues; we really want the flow network to be preserved
+        volume_error = 0.0
+        for i in range(len(descending_elev_nodes)):
+            nid = descending_elev_nodes[i]
+
+            new_elev = highest_elev - i * epsilon
+
+            assert(numpy.all(deposition_change[nid] == 0.0))  # we have no way to deal with interconnected flow networks yet
+
+            deposition_change[nid] = new_elev - elev[nid]
+
+            volume_error += i * epsilon * areas[nid]
+
+        print 'volume_error = %s' % volume_error
+
+        # FIXME: how do we distribute sediment underwater? none of the under-sea cases have been considered yet
+        # this algorithm won't fill-from-edge and will change the behaviour of the delta (?) model - the one where the sea level shifts up and down
+
+    def _single_catchment_fill(self, elev, xymin, xymax, max_dt, sea, areas, fillH, diff_flux, neighbours):
+        '''
+        Deposition algorithm as described at ...
+
+        Sets the timestep such that a single catchment is filled on each
+        timestep. This is faster than the existing algorithm which fills a
+        little bit up to the water level but requires many more timesteps to
+        progress the simulation to the same point.
+
+        PARAMETERS
+        max_dt: maximum timestep in A, determined by previous steps in the model
+        elev: numpy array giving elevation of each TIN node
+        sea: scalar sea level
+
+        RETURN VALUES
+        elev_change: numpy array giving change in elevation for each node
+        dt: length of the timestep in A. This must not be changed by subsequent
+            steps in the model.
+        '''
+
+        dt = max_dt
+
+        # rate of change on each node
+        change = numpy.empty_like(elev)
+        change.fill(-1.e6)
+
+        erosion_rate = numpy.empty_like(elev)
+        erosion_rate.fill(-1.e6)
+
+        deposition_volume_rate = numpy.zeros_like(elev)
+
+        # For each node, we track the sink node (endpoint of any water runoff).
+        # -1 means 'unknown', 0+ are node ids
+        # so sinks[123] is the sink node id for node 123
+        sinks = numpy.empty(elev.shape, dtype=int)
+        sinks.fill(-1)
+
+        # for each flow...
+        # we're going to iteratively calculate sediment flow down hills, so we iterate from highest to lowest node
+        ordered_ids = numpy.argsort(elev)
+        # '[::-1]' reverses sort order
+        for donor, recvr in [(donor, self.receivers[donor]) for donor in ordered_ids[::-1]]:
+            # we have a sink node (bottom of the drainage network) where donor drains into itself
+            is_sink = (donor == recvr)
+
+            dh = elev[donor] - elev[recvr]
+            if elev[donor] > sea and elev[recvr] < sea:
+                dh = elev[donor] - sea
+
+            '''
+            Tristan's stability tweaks - hopefully not needed here
+
+            SPL = 0.
+            dh = 0.95 * (elev[donor] - elev[recvr])
+
+            if elev[donor] > sea and elev[recvr] < sea:
+                dh = elev[donor] - sea
+
+            if dh < 0.001:
+                dh = 0.
+            waterH = fillH[donor] - elev[donor]
+            '''
+
+
+            # Without this, we end up limiting timestep on flows with tiny dh
+            if dh < 0.001:
+                dh = 0.
+
+            # 1. CALCULATE EROSION/DEPOSITION ON EACH NODE AND ANY TIMESTEP CONSTRAINTS
+            rate = 0.0
+            # TODO what do we do if these conditions are not met?
+            if not is_sink and dh > 0.0 and elev[donor] >= sea:
+                dist = math.sqrt((self.xycoords[donor, 0] - self.xycoords[recvr, 0]) ** 2.0 + (self.xycoords[donor, 1] - self.xycoords[recvr, 1]) ** 2.0)
+
+                # Node erosion rate (SPL): Braun 2013 eqn (2)
+                rate = -self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
+
+                # If we fill at this rate, will we fill the depression past level?
+                # We don't want to do this as we will change the flow network
+                olddt = dt
+                dt = min(dt, -0.999 * dh / (rate * areas[donor]))
+                if olddt != dt:
+                    print 'dt = %s because rate=%s, area=%s, dh=%s' % (dt, rate, areas[donor], dh)
+                '''
+                if -rate * dt > elev[donor] - elev[recvr]:
+                    # print *, "case B", newdt, mtime
+                    # TODO: you could improve this by choosing the rate so as to fit halfway between the two nodes with closest elevation
+                    # FIXME: inconsistency between elev[donor]-elev[recvr] and then use of dh?
+                    # dt = min(dt, -0.999 * dh / rate)
+                    dt = min(dt, -0.999 * (elev[donor] - elev[recvr]) / (rate * areas[donor]))
+                    assert dt > 0
+                    print 'DEBUG: flow reversal constraint on node %s. new dt is %s' % (donor, dt)
+                    # BUT FIXME: the receiver node will probably erode as well, changing the dh, so it might be worth waiting before we determine the dh
+                    # so then, shouldn't we work out net rate of change on every node, and then for any nodes with net erosion, set dt to ensure that we don't change flow network? but this a simultaneous equation type situation; how much erosion is too much? unless you just solve it iteratively over timesteps
+                    '''
+
+                # TODO: what about the same constraint but where you erode a node so far that the gradient reverses?
+
+                erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
+                # TODO: this should also include the diff_flux parameter
+                # erosion_rate[donor] = rate * areas[donor]  # we erode material from the donor...  (HEIGHT per year)
+                assert erosion_rate[donor] <= 0.0
+
+                # if donor == 37610:
+                    # print 'ero %s = %s/year' % (donor, erosion_rate[donor] / dt)
+
+                # print donor, rate, areas[donor], erosion_rate[donor]
+
+                # what's happening is that we're getting too much erosion on a few nodes and the final elev_change is really huge. 
+                # how much is too much erosion?
+
+                # We will deposit the same amount, but we need to work out where to deposit it.
+                # Do we already know the sink node (bottom point) for the receiver in question?
+                sink_id = self._resolve_sink(sinks, recvr)
+                assert sink_id >= 0
+                deposition_volume_rate[sink_id] -= erosion_rate[donor] * areas[donor]  # VOLUME per year
+                # we verify that deposition_rate is always positive below
+                # assert deposition_rate[sink_id] >= 0.0
+            else:
+                erosion_rate[donor] = 0.0  # DEBUG ONLY
+
+        # From this point, dt is fixed for the rest of the tick
+        print 'TICK dt IS %s' % dt
+
+        # elev_change is the elevation change given the known timestep
+        elev_change = erosion_rate * dt
+        new_elev = elev + elev_change
+
+        deposition_change = numpy.zeros_like(elev_change)
+
+        # We know the *rate* of deposition on each node, but it is likely that
+        # that will overfill some of the catchments. For any nodes with
+        # positive deposition, work out the catchment size and redistribute any
+        # excess sediment.
+
+        # The only nodes with positive deposition should be sink nodes.
+        assert(numpy.all(deposition_volume_rate >= 0.0))
+        deposition_sinks = numpy.argwhere(deposition_volume_rate > 0.0)
+        # print 'sinks are %s' % deposition_sinks
+        assert numpy.all(self.receivers[deposition_sinks] == deposition_sinks)
+        catchment_volume = {}  # sink_id: catchment volume
+        catchment_sill = {}  # sink_id: sill node id for that catchment
+
+        # Work out the catchment volume of each sink
+        for sink_id_array in deposition_sinks:
+            sink_id = int(sink_id_array)
+            # NOTE: if we spill deposition later, this will need to be changed as we could have EVEN MORE deposition to apply
+            max_volume_needed = deposition_volume_rate[sink_id] * dt
+            catchment_volume[sink_id], catchment_sill[sink_id] = self._catchment_capacity(sink_id, new_elev, max_volume_needed, areas, neighbours)
+
+        # TODO FUTURE: At this point, you want to work out how to distribute excess sediment that does not fit in a catchment
+        # Right now we just discard any excess sediment
+
+        assert(numpy.all(new_elev <= elev))
+        for sink_id in deposition_sinks:
+            self._distribute_sediment(int(sink_id), deposition_change=deposition_change, elev=new_elev, rate=deposition_volume_rate[sink_id], dt=dt, sill_id=catchment_sill, sinks=sinks, areas=areas, neighbours=neighbours)
+
+        elev_change += deposition_change
+
+        # import pdb; pdb.set_trace()
+
+        return elev_change, dt
+
+
+
+
+        '''
+            # 2. LIMIT TIMESTEP BASED ON MAXIMUM DEPOSITION ON SINK NODES
+            # NOTE: we never limit timestep for this yet, but we discard sediment
+            donor_rate = deposition_rate[donor]
+            if is_sink and donor_rate > 0.0:
+                # we're a sink node and there is material being added to us
+                # what's our maximum capacity?
+
+                # timestep is dependent on us being able to fill the catchment in one step. There's no point in overfilling it, so stop calculating volume once we know we can accomodate the amount of sediment.
+                max_volume_needed = donor_rate * dt
+
+                catchment_volume = self._catchment_capacity(donor, max_volume_needed=max_volume_needed, areas, neighbours)
+
+                if catchment_volume < max_volume_needed:
+                    # we will overfill the catchment
+                    # IN THIS VERSION OF THE ALGORITHM, we ignore the overfill and discard it so as to not limit the timestep
+                    # THIS COULD BE VASTLY IMPROVED
+                    # if you assume that you know the final dt at this point you could switch from sediment rate to sediment volume and then propagate excess sediment down to the next catchment
+                    discarded = donor_rate * dt
+                    print 'discarding overfill of %s' % discarded
+
+        change = erosion_rate + deposition_rate
+
+        for donor, recvr in [(donor, self.receivers[donor]) for donor in ordered_ids[::-1]]:
+            # Update borders
+            if self.xycoords[donor, 0] < xymin[0] or self.xycoords[donor, 1] < xymin[1] or self.xycoords[donor, 0] > xymax[0] or self.xycoords[donor, 1] > xymax[1]:
+                change[donor] = 0.
+
+        return change, dt
+        # TODO: you could collapse erosion_rate and deposition_rate easily
+        # import sys; sys.exit(0)
+
+        '''
+        '''
+            maxh = self.maxh[donor]
+            if elev[donor] < sea:
+                maxh = sea - elev[donor]
+            elif waterH > 0.:
+                maxh = min(waterH, maxh)
+
+            maxh *= 0.95
+            Qs = 0.
+
+            # Deposition case
+            if SPL == 0. and areas[donor] > 0.:  # if no stream power AND donor has finite drainage area ??? what does this mean?
+                if maxh > 0. and elev[donor] < sea:  # if there's water AND we are under the sea - *** this sounds like an obscure case
+                    if sedFluxes[donor] * newdt / areas[donor] < maxh:  # will the sediment deposition stay under the water/sea level?
+                        SPL = sedFluxes[donor] / areas[donor]  # set new stream power (?) what does this mean? 
+                        Qs = 0.  # no new flow on this node
+                    else:
+                        SPL = maxh / newdt  # maximum SPL?
+                        Qs = sedFluxes[donor] - SPL * areas[donor]  # maximum flow/deposition on receiver?
+
+                # Fill depression
+                elif waterH > 0.0001 and donor != recvr:  # if there is water AND flow is between two different nodes
+                    dh = 0.95 * waterH
+                    if sedFluxes[donor] * newdt / areas[donor] < dh:  # if deposition stays under water level
+                        SPL = sedFluxes[donor] / areas[donor]  # stream power is determined by ???
+                        Qs = 0.  # no new flow on receiver
+                    else:
+                        # same as above - use maximum flow
+                        SPL = dh / newdt
+                        Qs = sedFluxes[donor] - SPL * areas[donor]
+
+                # Base-level (sink)
+                elif donor == recvr and areas[donor] > 0.:  # if this is a sink
+                    SPL = sedFluxes[donor] / areas[donor]
+                    Qs = 0.
+                else:
+                    Qs = sedFluxes[donor]
+
+            # Erosion case
+            elif SPL < 0.:  # if we are ERODING i.e. negative power (?)
+
+                Qs = -SPL * areas[donor] + sedFluxes[donor]  # receiver gets additional deposit depending on spl/area of donor and all sediment on donor
+
+            # Update sediment flux in receiver node
+            sedFluxes[recvr] += Qs  # receiver gets more sediment
+            # print 'apply %s to %s which now has %s' % (Qs, recvr, sedFluxes[recvr])
+            change[donor] = SPL + diff_flux[donor]  # set donor spl (happens once per donor)
+
+            # Update borders
+            if self.xycoords[donor, 0] < xymin[0] or self.xycoords[donor, 1] < xymin[1] or self.xycoords[donor, 0] > xymax[0] or self.xycoords[donor, 1] > xymax[1]:
+                change[donor] = 0.
+
+            # Update base levels
+            if donor == recvr and change[donor] > 0.:  # this is a sink node AND pyChange is set
+                if waterH == 0.:  # no water
+                    mtime = self.maxdep[donor] / change[donor]  # pymaxd is depth of flow (difference in height from donor to receiver). TODO what is pychange?
+                    # i guess pychange is rate of change - maxdepth / rate of change = max years - don't fill past level?
+                    # this determines mtime (maxtime)
+                    # this MIGHT BE the main constraint *********
+                    # print *, "case C", newdt, mtime
+                    newdt = min(newdt, mtime)
+                else:
+                    mtime = waterH / change[donor]  # pymaxd
+                    # this is WATER case
+                    # don't fill past water?
+                    # THIS IS THE MAIN CONSTRAINT. The other cases are not touched!
+                    print "case D, node %s %s %s" % (newdt, mtime, donor)
+                    newdt = min(newdt, mtime)
+
+        # return sedFluxes, newdt
+        return change, newdt
+        '''
+
+    # NOTE: we're using mindt, but that doesn't really make sense given we're passing back the absolute different in elevations. We should be adhering to mindt.
