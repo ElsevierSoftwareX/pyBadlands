@@ -871,10 +871,6 @@ class flowNetwork:
         if len(unvisited_ids) == 0:
             # we ran out of nodes to raise
             print 'DISCARDING SEDIMENT volume %s on top of %s' % (deposition_amount - volume, volume)
-        elif volume > deposition_amount:
-            # scale back the last amount of deposition
-            # NOT IMPLEMENTED
-            print 'TAKING A SHORTCUT we have excess deposition (total = %s, allocated = %s, sink_id = %s)' % (deposition_amount, volume, sink_id)
         # else, we did not fill the catchment
 
         # work out how to fill the nodes
@@ -892,7 +888,7 @@ class flowNetwork:
         # work out how much to change their deposition amount by
         # we want to raise them all to (highest_elev - count * epsilon)
         epsilon = 0.00001  # NOTE: we could use next_after, but that is likely to lead to numerical stability issues; we really want the flow network to be preserved
-        volume_error = 0.0
+        allocated_volume = 0.0
         for i in range(len(descending_elev_nodes)):
             nid = descending_elev_nodes[i]
 
@@ -900,11 +896,19 @@ class flowNetwork:
 
             assert(numpy.all(deposition_change[nid] == 0.0))  # we have no way to deal with interconnected flow networks yet
 
-            deposition_change[nid] = new_elev - elev[nid]
+            delta = new_elev - elev[nid]
+            delta_volume = delta * areas[nid]
 
-            volume_error += i * epsilon * areas[nid]
+            if allocated_volume + delta_volume > deposition_amount:
+                # scale it back
+                remaining_volume = deposition_amount - allocated_volume
+                delta = remaining_volume / areas[nid]
+                delta_volume = remaining_volume
+                break
+            else:
+                allocated_volume += delta_volume
 
-        print 'volume_error = %s' % volume_error
+            deposition_change[nid] = delta
 
         # FIXME: how do we distribute sediment underwater? none of the under-sea cases have been considered yet
         # this algorithm won't fill-from-edge and will change the behaviour of the delta (?) model - the one where the sea level shifts up and down
