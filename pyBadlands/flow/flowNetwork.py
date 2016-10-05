@@ -962,25 +962,6 @@ class flowNetwork:
             if elev[donor] > sea and elev[recvr] < sea:
                 dh = elev[donor] - sea
 
-            '''
-            Tristan's stability tweaks - hopefully not needed here
-
-            SPL = 0.
-            dh = 0.95 * (elev[donor] - elev[recvr])
-
-            if elev[donor] > sea and elev[recvr] < sea:
-                dh = elev[donor] - sea
-
-            if dh < 0.001:
-                dh = 0.
-            waterH = fillH[donor] - elev[donor]
-            '''
-
-
-            # Without this, we end up limiting timestep on flows with tiny dh
-            if dh < 0.001:
-                dh = 0.
-
             # 1. CALCULATE EROSION/DEPOSITION ON EACH NODE AND ANY TIMESTEP CONSTRAINTS
             rate = 0.0
             # TODO what do we do if these conditions are not met?
@@ -1072,12 +1053,7 @@ class flowNetwork:
 
         elev_change += deposition_change
 
-        # import pdb; pdb.set_trace()
-
         return elev_change, dt
-
-
-
 
         '''
             # 2. LIMIT TIMESTEP BASED ON MAXIMUM DEPOSITION ON SINK NODES
