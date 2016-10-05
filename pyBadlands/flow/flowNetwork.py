@@ -432,9 +432,12 @@ class flowNetwork:
                 sedflux, newdt = FLOWalgo.flowcompute.sedflux_capacity(self.localstack,self.receivers,self.xycoords,\
                          Acell,xymin,xymax,self.discharge,elev,diff_flux,cumdiff,self.erodibility, \
                          self.m,self.n,self.bedrock,self.alluvial,sealevel,dt)
+                diff = None
 
             tempIDs = numpy.where(sedflux < -9.5e5)
-            sedflux[tempIDs] = 0.
+            if sedflux is not None:
+                sedflux[tempIDs] = 0.
+            print 'mindt is %s, newdt is %s; I choose the largest' % (self.mindt, newdt)
             newdt = max(self.mindt,newdt)
             sedrate = sedflux
 
@@ -968,15 +971,15 @@ class flowNetwork:
             if not is_sink and dh > 0.0 and elev[donor] >= sea:
                 dist = math.sqrt((self.xycoords[donor, 0] - self.xycoords[recvr, 0]) ** 2.0 + (self.xycoords[donor, 1] - self.xycoords[recvr, 1]) ** 2.0)
 
-                # Node erosion rate (SPL): Braun 2013 eqn (2)
+                # Node erosion rate (SPL): Braun 2013 eqn (2), measured in HEIGHT per year
                 rate = -self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
 
                 # If we fill at this rate, will we fill the depression past level?
                 # We don't want to do this as we will change the flow network
                 olddt = dt
-                dt = min(dt, -0.999 * dh / (rate * areas[donor]))
+                dt = min(dt, -0.999 * dh / rate)
                 if olddt != dt:
-                    print 'dt = %s because rate=%s, area=%s, dh=%s' % (dt, rate, areas[donor], dh)
+                    print 'dt = %s because rate=%s, dh=%s' % (dt, rate, dh)
                 '''
                 if -rate * dt > elev[donor] - elev[recvr]:
                     # print *, "case B", newdt, mtime
