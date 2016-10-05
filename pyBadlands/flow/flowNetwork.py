@@ -751,6 +751,49 @@ class flowNetwork:
 
         Returns the sink node id.
         """
+
+        # We're using an explicit stack as we can get very long chains for
+        # large TINs - longer than Python's 1000 call stack limit.
+        assert nid >= 0
+
+        # This is the common case, so short-circuit if possible
+        if sinks[nid] >= 0:
+            return sinks[nid]
+
+        # Not found, set up a proper search
+        # We build the stack from the end
+        stack = [nid]
+
+        while len(stack):
+            cid = stack[-1]
+
+            recvr = self.receivers[cid]
+
+            if cid == recvr:  # sink node
+                sinks[cid] = cid
+                # cid is now resolved, pop it
+                stack.pop()
+            else:
+                # find recvr's sink
+                if sinks[recvr] >= 0:
+                    sinks[cid] = sinks[recvr]
+                    stack.pop()
+                    continue
+                else:
+                    stack.append(recvr)
+
+        assert sinks[nid] >= 0
+        return sinks[nid]
+
+    def _resolve_sink_recursive(self, sinks, nid, seen=None):
+        """
+        For a given node id 'nid', figure out its sink node id. Update 'sinks'
+        and return the resolved sink node id.
+
+        Updates 'sinks' in-place.
+
+        Returns the sink node id.
+        """
         assert nid >= 0
 
         if sinks[nid] >= 0:
