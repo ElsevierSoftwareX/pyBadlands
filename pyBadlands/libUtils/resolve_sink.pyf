@@ -1,14 +1,15 @@
 python module resolve_sink
   interface
-    subroutine resolve_sink(receivers, sinks, nid, sink_id, len_receivers, len_sinks)
+    subroutine resolve_sink(receivers, sinks, nid, sea, elev, sink_id, n)
       intent(c) resolve_sink               ! it's a C function
       intent(c)                            ! all arguments are C indexed
   
-      integer intent(hide), depend(receivers) :: len_receivers = len(receivers)
-      integer intent(hide), depend(sinks) :: len_sinks = len(sinks)
+      integer intent(hide), depend(receivers) :: n = len(receivers)
       integer intent(in) :: nid
-      integer intent(in) :: receivers(len_receivers)
-      integer intent(inplace) :: sinks(len_sinks)
+      double precision intent(in) :: sea
+      double precision intent(in) :: elev(n)
+      integer intent(in) :: receivers(n)
+      integer intent(inplace) :: sinks(n)
       integer intent(out) :: sink_id(1)
     end subroutine resolve_sink
   end interface

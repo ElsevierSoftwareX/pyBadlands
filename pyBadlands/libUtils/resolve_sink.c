@@ -45,7 +45,7 @@ void stack_del(stack *s) {
     free(s->items);
 }
 
-void resolve_sink(int receivers[], int sinks[], int nid, int *sink_id)
+void resolve_sink(int receivers[], int sinks[], int nid, double sea, double elev[], int *sink_id)
 {
     stack stack_obj;
     stack *s = &stack_obj;
@@ -59,7 +59,8 @@ void resolve_sink(int receivers[], int sinks[], int nid, int *sink_id)
         int cid = stack_peek(s);
         int recvr = receivers[cid];
 
-        if (cid == recvr) {  // sink node
+        if (cid == recvr || elev[cid] < sea) {
+            // EITHER this is a sink node OR we're under the sea, so deposit directly onto this node
             sinks[cid] = cid;
             // cid is now resolved, pop it
             stack_pop(s);
