@@ -98,6 +98,7 @@ def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
 
     return fillH
 
+
 def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDisp, \
                   mapero, cumdiff, fillH, disp, inGIDs, elevation, tNow, tEnd, verbose=False):
     """
@@ -131,6 +132,7 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
             flow.dt_stability(elevation, inGIDs)
 
     CFLtime = min(flow.CFL, hillslope.CFL)
+    print '\tflow CFL = %s, hillslope CFL = %s, I choose smallest (%s)' % (flow.CFL, hillslope.CFL, CFLtime)
     CFLtime = max(input.minDT, CFLtime)
     if rank == 0 and verbose:
         print " -   Get CFL time step ", time.clock() - walltime
@@ -145,14 +147,22 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
     walltime = time.clock()
     xyMin = [recGrid.regX.min(), recGrid.regY.min()]
     xyMax = [recGrid.regX.max(), recGrid.regY.max()]
-    tstep, sedrate = flow.compute_sedflux(FVmesh.control_volumes, elevation, fillH, xyMin, xyMax,
-                                          diff_flux, CFLtime, force.sealevel, cumdiff)
+
+    timestep = min(CFLtime, tEnd - tNow)
+    # TODO: review this; aren't you doing this as part of sedflux now?
+    if timestep < CFLtime:
+        print '\tdisplay restricts timestep to %s' % timestep
+
+    timestep, sedrate, diff = flow.compute_sedflux(FVmesh.control_volumes, elevation, fillH, xyMin, xyMax,
+                                          diff_flux, timestep, force.sealevel, cumdiff, neighbours=tMesh.neighbours)
+
+    print '\tFINAL TIMESTEP is %s' % timestep
     if rank == 0 and verbose:
         print " -   Get stream fluxes ", time.clock() - walltime
 
-    # Update surface parameters and time
-    timestep = min(tstep, tEnd-tNow)
-    diff = sedrate * timestep
+    if np.any(sedrate):
+        assert diff is None
+        diff = sedrate * timestep
 
     if input.filter:
         smthdiff = flow.gaussian_filter(diff)
