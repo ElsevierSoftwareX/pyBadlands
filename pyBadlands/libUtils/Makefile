@@ -45,7 +45,7 @@ FV_LMOD = FVframe
 OR_FMOD = ORclass
 OR_LMOD = ORmodel
 
-all: ${PD_LMOD}.so ${SFD_LMOD}.so ${FLOW_LMOD}.so ${LOOP_LMOD}.so ${FNET_FMOD}.so ${FNET_LMOD}.so ${FV_FMOD}.so ${FV_LMOD}.so ${OR_FMOD}.so ${OR_LMOD}.so sfd.so
+all: ${PD_LMOD}.so ${SFD_LMOD}.so ${FLOW_LMOD}.so ${LOOP_LMOD}.so ${FNET_FMOD}.so ${FNET_LMOD}.so ${FV_FMOD}.so ${FV_LMOD}.so ${OR_FMOD}.so ${OR_LMOD}.so sfd.so resolve_sink.so
 
 	@echo ""
 	@echo ""
@@ -96,6 +96,9 @@ ${OR_LMOD}.so: ${OR_LMOD}.f90
 
 sfd.so: sfd.c sfd.pyf
 	${F2PY} ${F2PY_FLAGS} -c -m sfd sfd.c sfd.pyf
+
+resolve_sink.so: resolve_sink.c resolve_sink.pyf
+	${F2PY} ${F2PY_FLAGS} -c -m resolve_sink resolve_sink.c resolve_sink.pyf
 
 clean:
 	rm -fv *~ *.bak *.o *.mod *.original *.so

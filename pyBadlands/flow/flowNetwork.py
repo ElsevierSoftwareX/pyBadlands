@@ -22,6 +22,7 @@ from pyBadlands.libUtils import SFDalgo as SFD
 import pyBadlands.libUtils.sfd as sfd
 from pyBadlands.libUtils import FLOWalgo
 from pyBadlands.libUtils import FLWnetwork
+from pyBadlands.libUtils.resolve_sink import resolve_sink
 
 class flowNetwork:
     """
@@ -753,65 +754,20 @@ class flowNetwork:
         Updates 'sinks' in-place.
 
         Returns the sink node id.
+
+        This calls out to a fast C implementation.
         """
 
-        # We're using an explicit stack as we can get very long chains for
-        # large TINs - longer than Python's 1000 call stack limit.
         assert nid >= 0
 
         # This is the common case, so short-circuit if possible
         if sinks[nid] >= 0:
             return sinks[nid]
 
-        # Not found, set up a proper search
-        # We build the stack from the end
-        stack = [nid]
-
-        while len(stack):
-            cid = stack[-1]
-
-            recvr = self.receivers[cid]
-
-            if cid == recvr:  # sink node
-                sinks[cid] = cid
-                # cid is now resolved, pop it
-                stack.pop()
-            else:
-                # find recvr's sink
-                if sinks[recvr] >= 0:
-                    sinks[cid] = sinks[recvr]
-                    stack.pop()
-                    continue
-                else:
-                    stack.append(recvr)
-
-        assert sinks[nid] >= 0
-        return sinks[nid]
-
-    def _resolve_sink_recursive(self, sinks, nid, seen=None):
-        """
-        For a given node id 'nid', figure out its sink node id. Update 'sinks'
-        and return the resolved sink node id.
-
-        Updates 'sinks' in-place.
-
-        Returns the sink node id.
-        """
-        assert nid >= 0
-
-        if sinks[nid] >= 0:
-            return sinks[nid]
-
-        # what's the receiver?
-        recvr = self.receivers[nid]
-        if recvr == nid:  # sink node
-            sinks[nid] = nid
-        else:
-            # recursively call to find recvr's sink
-            sinks[nid] = self._resolve_sink(sinks, recvr)
-
-        assert sinks[nid] >= 0
-        return sinks[nid]
+        # Call the C code to do a search
+        sink_id = resolve_sink(self.receivers, sinks, nid)
+        assert sink_id >= 0
+        return sink_id
 
     def _distribute_sediment(self, sink_id, elev, sill_id, deposition_change, rate, dt, sinks, areas, neighbours):
         """
