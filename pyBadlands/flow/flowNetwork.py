@@ -388,6 +388,7 @@ class flowNetwork:
 
             # Stream power law
             elif self.spl:
+                print "PARALLEL NOT IMPLEMENTED"
                 sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity(self.localstack,self.receivers,self.xycoords, \
                          Acell,xymin,xymax,self.maxh,self.maxdep,self.discharge,fillH,elev,diff_flux, \
                          self.erodibility,self.m,self.n,sealevel,dt)
@@ -424,9 +425,8 @@ class flowNetwork:
 
             # Stream power law
             elif self.spl:
-                sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity(self.localstack,self.receivers,self.xycoords, \
-                         Acell,xymin,xymax,self.maxh,self.maxdep,self.discharge,fillH,elev,diff_flux, \
-                         self.erodibility,self.m,self.n,sealevel,dt)
+                diff, newdt = self._single_catchment_fill(areas=Acell, xymin=xymin, xymax=xymax, elev=elev, max_dt=dt, sea=sealevel, fillH=fillH, diff_flux=diff_flux, neighbours=neighbours)
+                sedflux = None
 
             # River carrying capacity case
             else:
@@ -438,11 +438,10 @@ class flowNetwork:
             tempIDs = numpy.where(sedflux < -9.5e5)
             if sedflux is not None:
                 sedflux[tempIDs] = 0.
-            print 'mindt is %s, newdt is %s; I choose the largest' % (self.mindt, newdt)
             newdt = max(self.mindt,newdt)
             sedrate = sedflux
 
-        return newdt,sedrate,diff
+        return newdt, sedrate, diff
 
     def gaussian_filter(self, diff):
         """
@@ -975,7 +974,6 @@ class flowNetwork:
                 erosion_rate[donor] = 0.0  # DEBUG ONLY
 
         # From this point, dt is fixed for the rest of the tick
-        print 'TICK dt IS %s' % dt
 
         # elev_change is the elevation change given the known timestep
         elev_change = erosion_rate * dt
