@@ -806,10 +806,11 @@ class flowNetwork:
         # touched_ids = set()
         visited_ids = set([sink_id])
         unvisited_ids = set([sink_id])
+        dv = deposition_volume[sink_id]
 
         volume = 0.0  # volume of sediment that we have distributed
 
-        while len(unvisited_ids) and volume < deposition_volume:
+        while len(unvisited_ids) and volume < dv:
             # again, prioqueues would help here
             lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_ids)
             lowest_elev = elev[lowest_id]
@@ -833,7 +834,7 @@ class flowNetwork:
 
         if len(unvisited_ids) == 0:
             # we ran out of nodes to raise
-            print 'DISCARDING SEDIMENT volume %s on top of %s' % (deposition_volume - volume, volume)
+            print 'DISCARDING SEDIMENT volume %s on top of %s' % (dv - volume, volume)
         # else, we did not fill the catchment
 
         # work out how to fill the nodes
@@ -862,9 +863,9 @@ class flowNetwork:
             delta = new_elev - elev[nid]
             delta_volume = delta * areas[nid]
 
-            if allocated_volume + delta_volume > deposition_volume:
+            if allocated_volume + delta_volume > dv:
                 # scale it back
-                remaining_volume = deposition_volume - allocated_volume
+                remaining_volume = dv - allocated_volume
                 delta = remaining_volume / areas[nid]
                 delta_volume = remaining_volume
                 break
@@ -873,36 +874,87 @@ class flowNetwork:
 
             deposition_change[nid] = delta
 
-        # FIXME: how do we distribute sediment underwater? none of the under-sea cases have been considered yet
-        # this algorithm won't fill-from-edge and will change the behaviour of the delta (?) model - the one where the sea level shifts up and down
-
-    def _distribute_sediment_sea(self, sink_id, elev, deposition_change, deposition_volume, areas, neighbours, sea):
+    def _distribute_sediment_sea(self, elev, deposition_change, deposition_volume, areas, neighbours, sea):
         '''
+        Resolves ALL of the deposits under sea. We treat them as an isolated
+        system as there's no way for sediment to 'build up' and become land.
+
         For under-sea deposition, we fill the sink node up to the sea level
-        (and add a fraction more so that that node is 'land' on the next
-        iteration.)
+        (less epsilon). If there's too much, we try to distribute the excess
+        sediment evenly among the neighbours.
 
-        TEMPORARILY, we are discarding excess sediment. However, this is likely
-        to discard way too much to be practical, especially where migration of
-        the shoreline is important (e.g. for the delta example).
+        deposition_volume reflects the initial or 'requested' deposition state
+        where most nodes will have too much sediment. deposition_change is
+        updated after resolution.
+
+        Right now, we're assuming that each node will have an 'unfilled'
+        neighbour where excess sediment can be deposited. It is unlikely that
+        all of the neighbours will be 'filled' - but it is theoretically
+        possible. Rather than try to address the (complex and slow) problem of
+        modelling underwater sediment movement in high deposition density
+        regions, we're just going to discard sediment if we can't easily find
+        somewhere to put it.
         '''
 
-        # VERY TEMPORARY: we're going to whack it all in a single node and chop it off if there's too much
+        filled_ids = set()
+        unresolved_ids = list(numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0])
 
-        # assert deposition_change[sink_id] == 0.0, deposition_change[sink_id]
+        epsilon = 0.0001
 
-        a = areas[sink_id]
-        dh = deposition_volume / a
-        new_elev = deposition_change[sink_id] + dh * a
+        while len(unresolved_ids):
+            sid = unresolved_ids.pop()
 
-        if new_elev > sea:
-            print 'DISCARD: %s on %s' % (new_elev - sea * a, sink_id)
-            new_elev = sea + 0.0001
-            # TODO: maybe track an index and do index * 0.0001 or similar
+            # how much sediment do we need to deposit on it?
+            dv = deposition_volume[sid]
+            assert dv > 0.0, 'dv = %s' % dv  # otherwise, why are we here?
+            deposition_volume[sid] = 0.0  # we're going to resolve it all. This is only used as a postcondition for this function.
+            a = areas[sid]
 
-        deposition_change[sink_id] = new_elev
+            # how much can it take?
+            maxh = sea - epsilon  # the highest absolute value we can raise this node
+            # TODO at this point, if any neighbours are near sea level, take *their* height minus epsilon so we retain ordering
+            # TODO should we be checking for nodes NEAR but not AT sea level and not filling them again so as to improve performance? Otherwise we'll keep filling with miniscule amounts and not progressing.
+            maxraise = (maxh - elev[sid] - deposition_change[sid])  # the most we can raise this node
+            capacity = maxraise * a
+            assert capacity > 0.0, 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
 
-        # up to here: you need to deposit all of the sediment to match the correct deposition rate
+            excess_capacity = capacity - dv
+
+            if excess_capacity > 0:
+                # easy; we're going to fill a bit and carry on
+                deposition_change[sid] += dv / a
+            else:
+                # It doesn't all fit. Assign what we can and look for somewhere else to deposit.
+                deposition_change[sid] += maxraise
+                filled_ids.add(sid)
+
+                # We still have to assign this much
+                remain = -excess_capacity
+
+                # Do any neighbours have space?
+                share_candidates = []
+                # TODO sort these randomly to reduce patterns introduced by triangulation
+                for nid in self._get_pythonic_neighbours(sid, neighbours):
+                    if nid not in filled_ids and elev[nid] < sea and nid not in unresolved_ids:
+                        share_candidates.append(nid)
+
+                if len(share_candidates) == 0:
+                    print "WARNING: discarding sediment volume %s because I can't find anywhere to put it" % remain
+                    continue
+
+                fraction = 1.0 / len(share_candidates)
+                for nid in share_candidates:
+                    deposition_volume[nid] += fraction * remain
+                    unresolved_ids.append(nid)
+
+        # check that all sea nodes have been resolved
+        final_unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
+        print final_unresolved_ids
+        assert(len(final_unresolved_ids) == 0)
+
+        # TODO confirm with Tristan that this behaviour is what we want (filling up to but not beyond sea level)
+        # if we turn it into land, we (a) might create new depressions, and (b) the rate of shore movement changes depending on the timesteps that we take, which doesn't make sense
+        # TODO: maybe track an index and do index * 0.0001 or similar
 
         # TODO: make sure erosion doesn't push a node under the sea level
         # TODO: how do you ensure that node ordering is maintained? how does the existing code handle this?
@@ -1024,7 +1076,6 @@ class flowNetwork:
 
         # The only nodes with positive deposition should be sink nodes.
         # assert(numpy.all(deposition_volume_rate >= 0.0))
-        sea_sinks = numpy.argwhere(numpy.logical_and(deposition_volume_rate > 0.0, elev < sea))
         land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume_rate > 0.0, elev >= sea))
         # assert numpy.all(self.receivers[deposition_sinks] == deposition_sinks)
         catchment_volume = {}  # sink_id: catchment volume
@@ -1046,19 +1097,16 @@ class flowNetwork:
 
         assert(numpy.all(new_elev <= elev))
 
+        deposition_volume = deposition_volume_rate * dt
+
         for sink_id_array in land_sinks:
             sink_id = int(sink_id_array)
-            deposition_volume = deposition_volume_rate[sink_id] * dt
 
             if elev[sink_id] < sea:
                 assert deposition_change[sink_id] == 0
                 self._distribute_sediment_land(sink_id, deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, sill_id=catchment_sill, sinks=sinks, areas=areas, neighbours=neighbours, sea=sea)
 
-
-        for sink_id_array in sea_sinks:
-            sink_id = int(sink_id_array)
-            deposition_volume = deposition_volume_rate[sink_id] * dt
-            self._distribute_sediment_sea(sink_id, deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
+        self._distribute_sediment_sea(deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
 
         elev_change += deposition_change
 
