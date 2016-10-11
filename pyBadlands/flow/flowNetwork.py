@@ -919,7 +919,6 @@ class flowNetwork:
             assert capacity > 0.0, 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
 
             excess_capacity = capacity - dv
-
             if excess_capacity > 0:
                 # easy; we're going to fill a bit and carry on
                 deposition_change[sid] += dv / a
@@ -949,7 +948,6 @@ class flowNetwork:
 
         # check that all sea nodes have been resolved
         final_unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
-        print final_unresolved_ids
         assert(len(final_unresolved_ids) == 0)
 
         # TODO confirm with Tristan that this behaviour is what we want (filling up to but not beyond sea level)
