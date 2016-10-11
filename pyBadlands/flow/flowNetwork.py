@@ -916,7 +916,10 @@ class flowNetwork:
             # TODO should we be checking for nodes NEAR but not AT sea level and not filling them again so as to improve performance? Otherwise we'll keep filling with miniscule amounts and not progressing.
             maxraise = (maxh - elev[sid] - deposition_change[sid])  # the most we can raise this node
             capacity = maxraise * a
-            assert capacity > 0.0, 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
+
+            if capacity < 0.0:
+                print 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
+            # assert capacity > 0.0, 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
 
             excess_capacity = capacity - dv
             if excess_capacity > 0:
@@ -1014,13 +1017,16 @@ class flowNetwork:
 
                 # Node erosion rate (SPL): Braun 2013 eqn (2), measured in HEIGHT per year
                 rate = -self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
+                rate += diff_flux[donor]   # integrate linear diffusion approximation (?)
+                rate = min(rate, 0.0)  # just in case it goes negative due to diff_flux
 
                 # If we fill at this rate, will we fill the depression past level?
                 # We don't want to do this as we will change the flow network
-                olddt = dt
-                dt = min(dt, -0.999 * dh / rate)
-                if olddt != dt:
-                    print 'dt = %s because rate=%s, dh=%s' % (dt, rate, dh)
+                if rate > 0.0:
+                    olddt = dt
+                    dt = min(dt, -0.999 * dh / rate)
+                    if olddt != dt:
+                        print 'dt = %s because rate=%s, dh=%s' % (dt, rate, dh)
                 '''
                 if -rate * dt > elev[donor] - elev[recvr]:
                     # print *, "case B", newdt, mtime
