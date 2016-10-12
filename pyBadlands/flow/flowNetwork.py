@@ -372,6 +372,8 @@ class flowNetwork:
 
         # Compute sediment flux using libUtils
 
+        diff = None  # not all code paths use this, so return None in the default case
+
         # Parallel case
         if(size > 1):
             # Purely erosive case
@@ -433,7 +435,6 @@ class flowNetwork:
                 sedflux, newdt = FLOWalgo.flowcompute.sedflux_capacity(self.localstack,self.receivers,self.xycoords,\
                          Acell,xymin,xymax,self.discharge,elev,diff_flux,cumdiff,self.erodibility, \
                          self.m,self.n,self.bedrock,self.alluvial,sealevel,dt)
-                diff = None
 
             tempIDs = numpy.where(sedflux < -9.5e5)
             if sedflux is not None:
