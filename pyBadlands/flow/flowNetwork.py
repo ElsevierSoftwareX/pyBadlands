@@ -881,82 +881,75 @@ class flowNetwork:
         system as there's no way for sediment to 'build up' and become land.
 
         For under-sea deposition, we fill the sink node up to the sea level
-        (less epsilon). If there's too much, we try to distribute the excess
-        sediment evenly among the neighbours.
+        (less epsilon). If there's too much, we send any excess to the
+        neighbour with the steepest slope.
 
         deposition_volume reflects the initial or 'requested' deposition state
         where most nodes will have too much sediment. deposition_change is
         updated after resolution.
-
-        Right now, we're assuming that each node will have an 'unfilled'
-        neighbour where excess sediment can be deposited. It is unlikely that
-        all of the neighbours will be 'filled' - but it is theoretically
-        possible. Rather than try to address the (complex and slow) problem of
-        modelling underwater sediment movement in high deposition density
-        regions, we're just going to discard sediment if we can't easily find
-        somewhere to put it.
         '''
 
-        filled_ids = set()
         unresolved_ids = list(numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0])
 
-        epsilon = 0.0001
-
+        epsilon = 0.000001
+        # Difference between sea level and node level. This is really tiny as we're using the heuristic that nodes we touch later should be lower (as they should be further from the deposition point). This destroys any undersea structure that may have already existed. It is intended only to ensure that there is a single undersea flow network.
         while len(unresolved_ids):
-            sid = unresolved_ids.pop()
+            sid = unresolved_ids.pop(0)
 
             # how much sediment do we need to deposit on it?
+            # dv tracks how much sediment remains to be deposited
             dv = deposition_volume[sid]
-            assert dv > 0.0, 'dv = %s' % dv  # otherwise, why are we here?
             deposition_volume[sid] = 0.0  # we're going to resolve it all. This is only used as a postcondition for this function.
-            a = areas[sid]
 
-            # how much can it take?
-            maxh = sea - epsilon  # the highest absolute value we can raise this node
-            # TODO at this point, if any neighbours are near sea level, take *their* height minus epsilon so we retain ordering
-            # TODO should we be checking for nodes NEAR but not AT sea level and not filling them again so as to improve performance? Otherwise we'll keep filling with miniscule amounts and not progressing.
-            maxraise = (maxh - elev[sid] - deposition_change[sid])  # the most we can raise this node
-            capacity = maxraise * a
+            maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
 
-            if capacity < 0.0:
-                print 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
-            # assert capacity > 0.0, 'cap %s elev %s chg %s sea %s area %s dv %s' % (capacity, elev[sid], deposition_change[sid], sea, a, dv)
+            last_sid = None
+            while dv > 0.0:
+                assert sid != last_sid, '%s %s' % (last_sid, sid)
+                last_sid = sid
 
-            excess_capacity = capacity - dv
-            if excess_capacity > 0:
-                # easy; we're going to fill a bit and carry on
-                deposition_change[sid] += dv / a
-            else:
-                # It doesn't all fit. Assign what we can and look for somewhere else to deposit.
-                deposition_change[sid] += maxraise
-                filled_ids.add(sid)
+                maxh -= epsilon  # on each step, raise to almost as high to retain slopes everywhere
+                a = areas[sid]
 
-                # We still have to assign this much
-                remain = -excess_capacity
+                # Determine the highest absolute value we can raise this node
+                # Don't raise beyond the sea level OR the donor node. This ensures
+                # there is always a downslope. It also ensures we do not create new
+                # undersea depressions.
 
-                # Do any neighbours have space?
-                share_candidates = []
-                # TODO sort these randomly to reduce patterns introduced by triangulation
-                for nid in self._get_pythonic_neighbours(sid, neighbours):
-                    if nid not in filled_ids and elev[nid] < sea and nid not in unresolved_ids:
-                        share_candidates.append(nid)
+                maxraise = (maxh - elev[sid] - deposition_change[sid])  # the most we can raise this node
+                capacity = maxraise * a
 
-                if len(share_candidates) == 0:
-                    print "WARNING: discarding sediment volume %s because I can't find anywhere to put it" % remain
+                if capacity < 0.0:
+                    # just send excess to its receiver
+                    # receiver id that will take excess
+                    rid = self.receivers[sid]
+                    if sid == rid:
+                        print 'found undersea sink a, discarding %s' % dv
+                        dv = 0.0
+                    else:
+                        sid = rid
                     continue
 
-                fraction = 1.0 / len(share_candidates)
-                for nid in share_candidates:
-                    deposition_volume[nid] += fraction * remain
-                    unresolved_ids.append(nid)
+                if capacity - dv > 0:  # if it all fits
+                    # fill a bit and carry on
+                    deposition_change[sid] += dv / a
+                    dv = 0.0
+                else:
+                    # It doesn't all fit. Assign what we can and look for somewhere else to deposit.
+                    deposition_change[sid] += maxraise
+
+                    # receiver id that will take excess
+                    rid = self.receivers[sid]
+                    if sid == rid:
+                        print 'found undersea sink b, discarding %s' % dv
+                        dv = 0.0
+                    else:
+                        dv -= capacity
+                        sid = rid
 
         # check that all sea nodes have been resolved
         final_unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
         assert(len(final_unresolved_ids) == 0)
-
-        # TODO confirm with Tristan that this behaviour is what we want (filling up to but not beyond sea level)
-        # if we turn it into land, we (a) might create new depressions, and (b) the rate of shore movement changes depending on the timesteps that we take, which doesn't make sense
-        # TODO: maybe track an index and do index * 0.0001 or similar
 
         # TODO: make sure erosion doesn't push a node under the sea level
         # TODO: how do you ensure that node ordering is maintained? how does the existing code handle this?
@@ -1009,6 +1002,9 @@ class flowNetwork:
             dh = elev[donor] - elev[recvr]
             if elev[donor] > sea and elev[recvr] < sea:
                 dh = elev[donor] - sea
+
+            if dh < 0.001:
+                dh = 0.0  # FLOWalgo.f90:347
 
             # 1. CALCULATE EROSION/DEPOSITION ON EACH NODE AND ANY TIMESTEP CONSTRAINTS
             rate = 0.0
