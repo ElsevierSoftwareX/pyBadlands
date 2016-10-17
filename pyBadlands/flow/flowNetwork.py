@@ -893,18 +893,14 @@ class flowNetwork:
 
         epsilon = 0.000001
 
-        for sid in numpy.nditer(unresolved_ids):
+        for sid in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
             # how much sediment do we need to deposit on it?
             # dv tracks how much sediment remains to be deposited
             dv = deposition_volume[sid]
 
             maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
 
-            last_sid = None
             while dv > 0.0:
-                assert sid != last_sid, '%s %s' % (last_sid, sid)
-                last_sid = sid
-
                 maxh -= epsilon  # on each step, raise to almost as high to retain slopes everywhere
                 a = areas[sid]
 
@@ -1017,41 +1013,17 @@ class flowNetwork:
                     dt = min(dt, -0.999 * dh / rate)
                     if olddt != dt:
                         print 'dt = %s because rate=%s, dh=%s' % (dt, rate, dh)
-                '''
-                if -rate * dt > elev[donor] - elev[recvr]:
-                    # print *, "case B", newdt, mtime
-                    # TODO: you could improve this by choosing the rate so as to fit halfway between the two nodes with closest elevation
-                    # FIXME: inconsistency between elev[donor]-elev[recvr] and then use of dh?
-                    # dt = min(dt, -0.999 * dh / rate)
-                    dt = min(dt, -0.999 * (elev[donor] - elev[recvr]) / (rate * areas[donor]))
-                    assert dt > 0
-                    print 'DEBUG: flow reversal constraint on node %s. new dt is %s' % (donor, dt)
-                    # BUT FIXME: the receiver node will probably erode as well, changing the dh, so it might be worth waiting before we determine the dh
-                    # so then, shouldn't we work out net rate of change on every node, and then for any nodes with net erosion, set dt to ensure that we don't change flow network? but this a simultaneous equation type situation; how much erosion is too much? unless you just solve it iteratively over timesteps
-                    '''
 
                 # TODO: what about the same constraint but where you erode a node so far that the gradient reverses?
 
                 erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
-                # TODO: this should also include the diff_flux parameter
-                # erosion_rate[donor] = rate * areas[donor]  # we erode material from the donor...  (HEIGHT per year)
                 assert erosion_rate[donor] <= 0.0
-
-                # if donor == 37610:
-                    # print 'ero %s = %s/year' % (donor, erosion_rate[donor] / dt)
-
-                # print donor, rate, areas[donor], erosion_rate[donor]
-
-                # what's happening is that we're getting too much erosion on a few nodes and the final elev_change is really huge. 
-                # how much is too much erosion?
 
                 # We will deposit the same amount, but we need to work out where to deposit it.
                 # Do we already know the sink node (bottom point) for the receiver in question?
                 sink_id = self._resolve_sink(sinks, recvr, elev, sea)
                 assert sink_id >= 0
                 deposition_volume_rate[sink_id] -= erosion_rate[donor] * areas[donor]  # VOLUME per year
-                # we verify that deposition_rate is always positive below
-                # assert deposition_rate[sink_id] >= 0.0
             else:
                 erosion_rate[donor] = 0.0  # DEBUG ONLY
 
@@ -1069,9 +1041,7 @@ class flowNetwork:
         # excess sediment.
 
         # The only nodes with positive deposition should be sink nodes.
-        # assert(numpy.all(deposition_volume_rate >= 0.0))
         land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume_rate > 0.0, elev >= sea))
-        # assert numpy.all(self.receivers[deposition_sinks] == deposition_sinks)
         catchment_volume = {}  # sink_id: catchment volume
         catchment_sill = {}  # sink_id: sill node id for that catchment
 
