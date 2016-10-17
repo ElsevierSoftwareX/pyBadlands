@@ -889,17 +889,14 @@ class flowNetwork:
         updated after resolution.
         '''
 
-        unresolved_ids = list(numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0])
+        unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
 
         epsilon = 0.000001
-        # Difference between sea level and node level. This is really tiny as we're using the heuristic that nodes we touch later should be lower (as they should be further from the deposition point). This destroys any undersea structure that may have already existed. It is intended only to ensure that there is a single undersea flow network.
-        while len(unresolved_ids):
-            sid = unresolved_ids.pop(0)
 
+        for sid in numpy.nditer(unresolved_ids):
             # how much sediment do we need to deposit on it?
             # dv tracks how much sediment remains to be deposited
             dv = deposition_volume[sid]
-            deposition_volume[sid] = 0.0  # we're going to resolve it all. This is only used as a postcondition for this function.
 
             maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
 
@@ -946,10 +943,6 @@ class flowNetwork:
                     else:
                         dv -= capacity
                         sid = rid
-
-        # check that all sea nodes have been resolved
-        final_unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
-        assert(len(final_unresolved_ids) == 0)
 
         # TODO: make sure erosion doesn't push a node under the sea level
         # TODO: how do you ensure that node ordering is maintained? how does the existing code handle this?
