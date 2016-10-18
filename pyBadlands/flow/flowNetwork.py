@@ -884,15 +884,15 @@ class flowNetwork:
         (less epsilon). If there's too much, we send any excess to the
         neighbour with the steepest slope.
 
-        deposition_volume reflects the initial or 'requested' deposition state
-        where most nodes will have too much sediment. deposition_change is
-        updated after resolution.
+        deposition_volume (inout) reflects the initial or 'requested'
+        deposition state where some nodes will have too much sediment.
+        deposition_change (inout) is updated after resolution.
+
+        elev is after erosion (in); can be modified at will as it is not used
+        later
         '''
 
         unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
-
-        epsilon = 0.000001
-
         for sid in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
             # how much sediment do we need to deposit on it?
             # dv tracks how much sediment remains to be deposited
@@ -900,28 +900,18 @@ class flowNetwork:
 
             maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
 
+            # until all of this donor's deposition is resolved
             while dv > 0.0:
-                maxh -= epsilon  # on each step, raise to almost as high to retain slopes everywhere
+                e = elev[sid] + deposition_change[sid]
+                # on each step, raise to almost as high to retain slopes everywhere
+                maxh = min(maxh, e + 0.95 * (maxh - e))
                 a = areas[sid]
 
-                # Determine the highest absolute value we can raise this node
-                # Don't raise beyond the sea level OR the donor node. This ensures
-                # there is always a downslope. It also ensures we do not create new
-                # undersea depressions.
-
-                maxraise = (maxh - elev[sid] - deposition_change[sid])  # the most we can raise this node
+                # the most we can raise this node
+                maxraise = maxh - e
+                if maxraise < 0.0:
+                    maxraise = 0.0
                 capacity = maxraise * a
-
-                if capacity < 0.0:
-                    # just send excess to its receiver
-                    # receiver id that will take excess
-                    rid = self.receivers[sid]
-                    if sid == rid:
-                        print 'found undersea sink a, discarding %s' % dv
-                        dv = 0.0
-                    else:
-                        sid = rid
-                    continue
 
                 if capacity - dv > 0:  # if it all fits
                     # fill a bit and carry on
@@ -935,6 +925,7 @@ class flowNetwork:
                     rid = self.receivers[sid]
                     if sid == rid:
                         print 'found undersea sink b, discarding %s' % dv
+                        # at this point, bounce back up to the start and retrace the flow network
                         dv = 0.0
                     else:
                         dv -= capacity
@@ -1058,8 +1049,6 @@ class flowNetwork:
         # TODO FUTURE: At this point, you want to work out how to distribute excess sediment that does not fit in a catchment
         # Right now we just discard any excess sediment
         # We also resolve all deposition in a single pass
-
-        assert(numpy.all(new_elev <= elev))
 
         deposition_volume = deposition_volume_rate * dt
 
