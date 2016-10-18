@@ -875,6 +875,30 @@ class flowNetwork:
 
             deposition_change[nid] = delta
 
+    def _lowest_neighbour(self, nid, neighbours, elev, deposition_change):
+        # taking into account new deposits, what is the lowest neighbour node?
+        # we can't use the existing flow network as our deposits have changed that
+        neigh = self._get_pythonic_neighbours(nid, neighbours)
+        neigh_elev = [elev[x] + deposition_change[x] for x in neigh]
+        # which is lowest?
+        # use self to start
+        lowest_id = nid
+        # TODO: subtract a bit from lowest_elev so we don't keep touching nodes with no useful capacity - done below but failing assertion?
+        lowest_elev = elev[nid] + deposition_change[nid]
+
+        for i in range(len(neigh)):
+            nelev = neigh_elev[i]
+
+            # is there any usable capacity?
+            # nmaxe = nelev + 0.94 * (lowest_elev - nelev)  # 0.94 vs 0.95 above
+            # assert nmaxe < lowest_elev
+
+            if nelev < lowest_elev:
+                lowest_elev = nelev
+                lowest_id = neigh[i]
+
+        return lowest_id, lowest_elev
+
     def _distribute_sediment_sea(self, elev, deposition_change, deposition_volume, areas, neighbours, sea):
         '''
         Resolves ALL of the deposits under sea. We treat them as an isolated
@@ -900,8 +924,12 @@ class flowNetwork:
 
             maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
 
+            # simple algorithm for now: we try all of the original neighbours but don't explore the flow network fully otherwise
+            starting_sid = sid
+            pass_allocation = 0.0
+
             # until all of this donor's deposition is resolved
-            while dv > 0.0:
+            while True:  # we will explicitly break from the loop
                 e = elev[sid] + deposition_change[sid]
                 # on each step, raise to almost as high to retain slopes everywhere
                 maxh = min(maxh, e + 0.95 * (maxh - e))
@@ -916,20 +944,29 @@ class flowNetwork:
                 if capacity - dv > 0:  # if it all fits
                     # fill a bit and carry on
                     deposition_change[sid] += dv / a
-                    dv = 0.0
+                    break
                 else:
                     # It doesn't all fit. Assign what we can and look for somewhere else to deposit.
                     deposition_change[sid] += maxraise
+                    dv -= capacity
+                    pass_allocation += capacity
 
-                    # receiver id that will take excess
-                    rid = self.receivers[sid]
-                    if sid == rid:
-                        print 'found undersea sink b, discarding %s' % dv
+                    lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev, deposition_change)
+
+                    # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
+                    if lowest_id == sid:
                         # at this point, bounce back up to the start and retrace the flow network
-                        dv = 0.0
+                        if pass_allocation == 0.0:
+                            # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
+                            print 'WARNING: undersea discard of volume %s' % dv
+                            break
+
+                        # go back to the start and try again
+                        sid = starting_sid
+                        pass_allocation = 0.0
+                        maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
                     else:
-                        dv -= capacity
-                        sid = rid
+                        sid = lowest_id
 
         # TODO: make sure erosion doesn't push a node under the sea level
         # TODO: how do you ensure that node ordering is maintained? how does the existing code handle this?
