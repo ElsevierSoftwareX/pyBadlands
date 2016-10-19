@@ -955,7 +955,7 @@ class flowNetwork:
 
                     # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
                     if lowest_id == sid:
-                        # at this point, bounce back up to the start and retrace the flow network
+                        # We're at a sink node. Bounce back up to the start and try descending the flow network again.
                         if pass_allocation == 0.0:
                             # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                             print 'WARNING: undersea discard of volume %s' % dv
@@ -1045,12 +1045,12 @@ class flowNetwork:
                 # TODO: what about the same constraint but where you erode a node so far that the gradient reverses?
 
                 erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
-                assert erosion_rate[donor] <= 0.0
+                # assert erosion_rate[donor] <= 0.0
 
                 # We will deposit the same amount, but we need to work out where to deposit it.
                 # Do we already know the sink node (bottom point) for the receiver in question?
                 sink_id = self._resolve_sink(sinks, recvr, elev, sea)
-                assert sink_id >= 0
+                # assert sink_id >= 0
                 deposition_volume_rate[sink_id] -= erosion_rate[donor] * areas[donor]  # VOLUME per year
             else:
                 erosion_rate[donor] = 0.0  # DEBUG ONLY
