@@ -956,7 +956,7 @@ class flowNetwork:
                     # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
                     if lowest_id == sid:
                         # We're at a sink node. Bounce back up to the start and try descending the flow network again.
-                        if pass_allocation == 0.0:
+                        if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
                             # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                             print 'WARNING: undersea discard of volume %s' % dv
                             break
@@ -969,7 +969,6 @@ class flowNetwork:
                         sid = lowest_id
 
         # TODO: make sure erosion doesn't push a node under the sea level
-        # TODO: how do you ensure that node ordering is maintained? how does the existing code handle this?
 
     def _single_catchment_fill(self, elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours):
         '''
@@ -997,9 +996,7 @@ class flowNetwork:
         change = numpy.empty_like(elev)
         change.fill(-1.e6)
 
-        erosion_rate = numpy.empty_like(elev)
-        erosion_rate.fill(-1.e6)
-
+        erosion_rate = numpy.zeros_like(elev)
         deposition_volume_rate = numpy.zeros_like(elev)
 
         # For each node, we track the sink node (endpoint of any water runoff).
@@ -1024,52 +1021,40 @@ class flowNetwork:
                 dh = 0.0  # FLOWalgo.f90:347
 
             # 1. CALCULATE EROSION/DEPOSITION ON EACH NODE AND ANY TIMESTEP CONSTRAINTS
-            rate = 0.0
-            # TODO what do we do if these conditions are not met?
+            rate = diff_flux[donor]  # rate of deposition (negative for erosion)
             if not is_sink and dh > 0.0 and elev[donor] >= sea:
                 dist = math.sqrt((self.xycoords[donor, 0] - self.xycoords[recvr, 0]) ** 2.0 + (self.xycoords[donor, 1] - self.xycoords[recvr, 1]) ** 2.0)
-
                 # Node erosion rate (SPL): Braun 2013 eqn (2), measured in HEIGHT per year
-                rate = -self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
-                rate += diff_flux[donor]   # integrate linear diffusion approximation (?)
-                rate = min(rate, 0.0)  # just in case it goes negative due to diff_flux
+                rate -= self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
 
-                # If we fill at this rate, will we fill the depression past level?
-                # We don't want to do this as we will change the flow network
-                if rate > 0.0:
-                    olddt = dt
-                    dt = min(dt, -0.999 * dh / rate)
-                    if olddt != dt:
-                        print 'dt = %s because rate=%s, dh=%s' % (dt, rate, dh)
-
-                # TODO: what about the same constraint but where you erode a node so far that the gradient reverses?
-
+            depo_rate = abs(rate)
+            if rate > 0.0:
+                depo_id = recvr
+            elif rate < 0.0:
                 erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
-                # assert erosion_rate[donor] <= 0.0
+                depo_id = donor
 
-                # We will deposit the same amount, but we need to work out where to deposit it.
-                # Do we already know the sink node (bottom point) for the receiver in question?
-                sink_id = self._resolve_sink(sinks, recvr, elev, sea)
-                # assert sink_id >= 0
-                deposition_volume_rate[sink_id] -= erosion_rate[donor] * areas[donor]  # VOLUME per year
-            else:
-                erosion_rate[donor] = 0.0  # DEBUG ONLY
+            # We will deposit the same amount, but we need to work out where to deposit it.
+            # Find the sink node (bottom point) for the receiver in question?
+            sink_id = self._resolve_sink(sinks, depo_id, elev, sea)
+            deposition_volume_rate[sink_id] += depo_rate * areas[donor]  # VOLUME per year
 
         # From this point, dt is fixed for the rest of the tick
 
         # elev_change is the elevation change given the known timestep
         elev_change = erosion_rate * dt
+        # TODO: if any nodes transition land->sea, we should probably only erode them down to the sea level
         new_elev = elev + elev_change
-
-        deposition_change = numpy.zeros_like(elev_change)
 
         # We know the *rate* of deposition on each node, but it is likely that
         # that will overfill some of the catchments. For any nodes with
         # positive deposition, work out the catchment size and redistribute any
         # excess sediment.
 
-        # The only nodes with positive deposition should be sink nodes.
-        land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume_rate > 0.0, elev >= sea))
+        deposition_volume = deposition_volume_rate * dt
+
+        # The only land nodes with positive deposition should be sink nodes.
+        land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume > 0.0, elev >= sea))
         catchment_volume = {}  # sink_id: catchment volume
         catchment_sill = {}  # sink_id: sill node id for that catchment
 
@@ -1080,15 +1065,14 @@ class flowNetwork:
                 continue  # skip if it's undersea
 
             # NOTE: if we spill deposition later, this will need to be changed as we could have EVEN MORE deposition to apply
-            max_volume_needed = deposition_volume_rate[sink_id] * dt
+            max_volume_needed = deposition_volume[sink_id]
             catchment_volume[sink_id], catchment_sill[sink_id] = self._catchment_capacity(sink_id, new_elev, max_volume_needed, areas, neighbours)
 
         # TODO FUTURE: At this point, you want to work out how to distribute excess sediment that does not fit in a catchment
         # Right now we just discard any excess sediment
         # We also resolve all deposition in a single pass
 
-        deposition_volume = deposition_volume_rate * dt
-
+        deposition_change = numpy.zeros_like(elev_change)
         for sink_id_array in land_sinks:
             sink_id = int(sink_id_array)
 
