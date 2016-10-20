@@ -1,6 +1,8 @@
 pyBadlands - python version of Badlands
 =====
 
+[![DOI](https://zenodo.org/badge/51286954.svg)](https://zenodo.org/badge/latestdoi/51286954)
+    
 <div align="center">
     <img width=500 src="https://github.com/badlands-model/Badlands-doc/blob/master/figures/sketch.png" alt="sketch Badlands" title="sketch of Badlands range of models."</img>
 </div>
@@ -61,6 +63,10 @@ A compilation of notebooks with examples are proposed to give you a quick feelin
 
 Some documentation related to the physics & assumptions of the model can be found in:
 
-**Salles, T. & Hardiman, L.: [Badlands: An open-source, flexible and parallel framework to study landscape dynamics](http://dx.doi.org/10.1016/j.cageo.2016.03.011), Computers & Geosciences, 91, 77-89, doi:10.1016/j.cageo.2016.03.011, 2016.**
++ **Salles, T. & Hardiman, L.: [Badlands: An open-source, flexible and parallel framework to study landscape dynamics](http://dx.doi.org/10.1016/j.cageo.2016.03.011), Computers & Geosciences, 91, 77-89, doi:10.1016/j.cageo.2016.03.011, 2016.**
++ **Salles, T.: [Badlands: A parallel basin and landscape dynamics model](http://dx.doi.org/10.1016/j.softx.2016.08.005), SoftwareX, doi:10.1016/j.softx.2016.08.005, 2016.**
 
-When you use **Badlands**, please cite the above paper.
+When you use **Badlands**, please cite the above papers and/or the following code release citable **DOI**:
+
+_Release v1.0.0 :_  
++ **Salles, T. & Howson, I.: [Release 1: badlands-model/pyBadlands](http://doi.org/10.5281/zenodo.160412), Zenodo, doi:10.5281/zenodo.160412, 2016.**
