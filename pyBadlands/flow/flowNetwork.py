@@ -723,8 +723,6 @@ class flowNetwork:
 
             # NOTE: this scales O(N^2) with node count. There are definitely more efficient algorithms!
             volume = self._volume_of_nodes(areas, nodes_in_catchment, lowest_elev, elev)
-            if not(volume > 0.0 or len(nodes_in_catchment) == 1):
-                import pdb; pdb.set_trace()
             assert volume > 0.0 or len(nodes_in_catchment) == 1
 
             # does it drain into the same catchment?
@@ -991,6 +989,7 @@ class flowNetwork:
         '''
 
         dt = max_dt
+        # dt is known for this whole function and cannot change
 
         # rate of change on each node
         change = numpy.empty_like(elev)
@@ -1006,14 +1005,12 @@ class flowNetwork:
         sinks.fill(-1)
 
         # for each flow...
-        # we're going to iteratively calculate sediment flow down hills, so we iterate from highest to lowest node
-        ordered_ids = numpy.argsort(elev)
-        # '[::-1]' reverses sort order
-        for donor, recvr in [(donor, self.receivers[donor]) for donor in ordered_ids[::-1]]:
-            # we have a sink node (bottom of the drainage network) where donor drains into itself
+        # this loop doesn't have any interactions and so can be trivially vectorised and parallelised
+        for donor, recvr in [(donor, self.receivers[donor]) for donor in range(len(elev))]:
+            # do we have a sink node (bottom of the drainage network) where donor drains into itself?
             is_sink = (donor == recvr)
 
-            dh = elev[donor] - elev[recvr]
+            dh = 0.95 * (elev[donor] - elev[recvr])
             if elev[donor] > sea and elev[recvr] < sea:
                 dh = elev[donor] - sea
 
@@ -1030,7 +1027,7 @@ class flowNetwork:
             depo_rate = abs(rate)
             if rate > 0.0:
                 depo_id = recvr
-            elif rate < 0.0:
+            elif rate <= 0.0:
                 erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
                 depo_id = donor
 
@@ -1038,8 +1035,6 @@ class flowNetwork:
             # Find the sink node (bottom point) for the receiver in question?
             sink_id = self._resolve_sink(sinks, depo_id, elev, sea)
             deposition_volume_rate[sink_id] += depo_rate * areas[donor]  # VOLUME per year
-
-        # From this point, dt is fixed for the rest of the tick
 
         # elev_change is the elevation change given the known timestep
         elev_change = erosion_rate * dt
