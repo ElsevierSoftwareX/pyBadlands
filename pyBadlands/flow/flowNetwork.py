@@ -831,7 +831,7 @@ class flowNetwork:
 
             raised_ids.add(lowest_id)
 
-        if len(unvisited_ids) == 0:
+        if len(unvisited_ids) == 0 and dv > volume:
             # we ran out of nodes to raise
             print 'DISCARDING SEDIMENT volume %s on top of %s' % (dv - volume, volume)
         # else, we did not fill the catchment
@@ -846,18 +846,15 @@ class flowNetwork:
         raised_ids_elevs = elev[raised_ids_array]
         # sort
         descending_elev_nodes = raised_ids_array[numpy.argsort(raised_ids_elevs)[::-1]]
-        highest_elev = elev[descending_elev_nodes[0]]
+        new_elev = elev[descending_elev_nodes[0]]
 
         # work out how much to change their deposition amount by
         # we want to raise them all to (highest_elev - count * epsilon)
         epsilon = 0.00001  # NOTE: we could use next_after, but that is likely to lead to numerical stability issues; we really want the flow network to be preserved
         allocated_volume = 0.0
-        for i in range(len(descending_elev_nodes)):
-            nid = descending_elev_nodes[i]
+        for nid in numpy.nditer(descending_elev_nodes):
+            new_elev -= epsilon
 
-            new_elev = highest_elev - i * epsilon
-
-            assert(numpy.all(deposition_change[nid] == 0.0))  # we have no way to deal with interconnected flow networks yet
 
             delta = new_elev - elev[nid]
             delta_volume = delta * areas[nid]
@@ -871,31 +868,29 @@ class flowNetwork:
             else:
                 allocated_volume += delta_volume
 
-            deposition_change[nid] = delta
+            deposition_change[nid] += delta
 
     def _lowest_neighbour(self, nid, neighbours, elev, deposition_change):
         # taking into account new deposits, what is the lowest neighbour node?
         # we can't use the existing flow network as our deposits have changed that
-        neigh = self._get_pythonic_neighbours(nid, neighbours)
-        neigh_elev = [elev[x] + deposition_change[x] for x in neigh]
-        # which is lowest?
-        # use self to start
-        lowest_id = nid
-        # TODO: subtract a bit from lowest_elev so we don't keep touching nodes with no useful capacity - done below but failing assertion?
-        lowest_elev = elev[nid] + deposition_change[nid]
+        # 'nid' could be the lowest
 
-        for i in range(len(neigh)):
-            nelev = neigh_elev[i]
+        neigh = neighbours[nid]
+        neigh = neigh[neigh >= 0]
+        neigh = numpy.append(neigh, nid)
+        nelevs = elev[neigh] + deposition_change[neigh]
+        min_index = nelevs.argmin()
+        return neigh[min_index], nelevs[min_index]
 
-            # is there any usable capacity?
-            # nmaxe = nelev + 0.94 * (lowest_elev - nelev)  # 0.94 vs 0.95 above
-            # assert nmaxe < lowest_elev
+    def _highest_neighbour(self, nid, neighbours, elev, deposition_change):
+        # taking into account new deposits, what is the highest neighbour node?
+        # 'nid' is not considered
 
-            if nelev < lowest_elev:
-                lowest_elev = nelev
-                lowest_id = neigh[i]
-
-        return lowest_id, lowest_elev
+        neigh = neighbours[nid]
+        neigh = neigh[neigh >= 0]
+        nelevs = elev[neigh] + deposition_change[neigh]
+        max_index = nelevs.argmax()
+        return neigh[max_index], nelevs[max_index]
 
     def _distribute_sediment_sea(self, elev, deposition_change, deposition_volume, areas, neighbours, sea):
         '''
@@ -914,7 +909,7 @@ class flowNetwork:
         later
         '''
 
-        unresolved_ids = numpy.where(numpy.logical_and(deposition_volume > 0.0, elev < sea))[0]
+        unresolved_ids = numpy.where((deposition_volume > 0.0) & (elev < sea))[0]
         for sid in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
             # how much sediment do we need to deposit on it?
             # dv tracks how much sediment remains to be deposited
@@ -925,6 +920,9 @@ class flowNetwork:
             # simple algorithm for now: we try all of the original neighbours but don't explore the flow network fully otherwise
             starting_sid = sid
             pass_allocation = 0.0
+
+            # We can get nodes that are very close together, within the 0.95 threshold. They will accept no deposition but we will bounce between them thinking they are
+            seen_nodes = set()
 
             # until all of this donor's deposition is resolved
             while True:  # we will explicitly break from the loop
@@ -944,16 +942,20 @@ class flowNetwork:
                     deposition_change[sid] += dv / a
                     break
                 else:
-                    # It doesn't all fit. Assign what we can and look for somewhere else to deposit.
+                    # It doesn't all fit. Where are we going to deposit the remainder to?
+                    lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev, deposition_change)
+
+                    # Assign what we can
                     deposition_change[sid] += maxraise
                     dv -= capacity
                     pass_allocation += capacity
 
-                    lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev, deposition_change)
 
                     # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
-                    if lowest_id == sid:
+                    if lowest_id == sid or lowest_id in seen_nodes:
                         # We're at a sink node. Bounce back up to the start and try descending the flow network again.
+
+                        # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                         if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
                             # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                             print 'WARNING: undersea discard of volume %s' % dv
@@ -964,6 +966,7 @@ class flowNetwork:
                         pass_allocation = 0.0
                         maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
                     else:
+                        seen_nodes.add(int(sid))
                         sid = lowest_id
 
         # TODO: make sure erosion doesn't push a node under the sea level
@@ -1018,6 +1021,7 @@ class flowNetwork:
                 dh = 0.0  # FLOWalgo.f90:347
 
             # 1. CALCULATE EROSION/DEPOSITION ON EACH NODE AND ANY TIMESTEP CONSTRAINTS
+            # TODO: flowalgo:352: we don't calculate erosion at all on nodes that are within the water height (i.e. might be deposited on)
             rate = diff_flux[donor]  # rate of deposition (negative for erosion)
             if not is_sink and dh > 0.0 and elev[donor] >= sea:
                 dist = math.sqrt((self.xycoords[donor, 0] - self.xycoords[recvr, 0]) ** 2.0 + (self.xycoords[donor, 1] - self.xycoords[recvr, 1]) ** 2.0)
@@ -1036,10 +1040,15 @@ class flowNetwork:
             sink_id = self._resolve_sink(sinks, depo_id, elev, sea)
             deposition_volume_rate[sink_id] += depo_rate * areas[donor]  # VOLUME per year
 
+        # No erosion or deposition on the borders
+        border_flags = (self.xycoords[:, 0] < xymin[0]) | (self.xycoords[:, 1] < xymin[1]) | (self.xycoords[:, 0] > xymax[0]) | (self.xycoords[:, 1] > xymax[1])
+        erosion_rate[border_flags] = 0.0
+        deposition_volume_rate[border_flags] = 0.0
+
         # elev_change is the elevation change given the known timestep
         elev_change = erosion_rate * dt
-        # TODO: if any nodes transition land->sea, we should probably only erode them down to the sea level
         new_elev = elev + elev_change
+        # Note that elev is before erosion, while new_elev is after. This is useful later for nodes that might transition from land->sea.
 
         # We know the *rate* of deposition on each node, but it is likely that
         # that will overfill some of the catchments. For any nodes with
@@ -1049,6 +1058,7 @@ class flowNetwork:
         deposition_volume = deposition_volume_rate * dt
 
         # The only land nodes with positive deposition should be sink nodes.
+        # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
         land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume > 0.0, elev >= sea))
         catchment_volume = {}  # sink_id: catchment volume
         catchment_sill = {}  # sink_id: sill node id for that catchment
@@ -1056,11 +1066,10 @@ class flowNetwork:
         # Work out the catchment volume of each sink - land only
         for sink_id_array in land_sinks:
             sink_id = int(sink_id_array)
-            if elev[sink_id] < sea:
-                continue  # skip if it's undersea
 
             # NOTE: if we spill deposition later, this will need to be changed as we could have EVEN MORE deposition to apply
             max_volume_needed = deposition_volume[sink_id]
+            # We use the *after* erosion figure to calculate capacity
             catchment_volume[sink_id], catchment_sill[sink_id] = self._catchment_capacity(sink_id, new_elev, max_volume_needed, areas, neighbours)
 
         # TODO FUTURE: At this point, you want to work out how to distribute excess sediment that does not fit in a catchment
@@ -1070,14 +1079,15 @@ class flowNetwork:
         deposition_change = numpy.zeros_like(elev_change)
         for sink_id_array in land_sinks:
             sink_id = int(sink_id_array)
-
-            if elev[sink_id] < sea:
-                assert deposition_change[sink_id] == 0
-                self._distribute_sediment_land(sink_id, deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, sill_id=catchment_sill, sinks=sinks, areas=areas, neighbours=neighbours, sea=sea)
+            assert deposition_change[sink_id] == 0
+            self._distribute_sediment_land(sink_id, deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, sill_id=catchment_sill, sinks=sinks, areas=areas, neighbours=neighbours, sea=sea)
 
         self._distribute_sediment_sea(deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
 
         elev_change += deposition_change
+
+        # No erosion or deposition on the borders
+        elev_change[border_flags] = 0.0
 
         return elev_change, dt
 
