@@ -24,6 +24,7 @@ from pyBadlands.libUtils import FLOWalgo
 from pyBadlands.libUtils import FLWnetwork
 from pyBadlands.libUtils.resolve_sink import resolve_sink
 
+
 class flowNetwork:
     """
     Class for handling flow network computation based on Braun & Willett's
@@ -672,11 +673,40 @@ class flowNetwork:
         limit elevation.
         """
 
-        volume = 0.0
-        for nid in node_id_set:
-            volume += areas[nid] * abs(limit_elev - elev[nid])
+        # FIXME: this is copy-pasted from the land sedimentation function
 
-        return volume
+        if len(node_id_set) == 0:
+            return 0.0
+
+        nids = numpy.array(list(node_id_set))
+
+        elevs = elev[nids]
+        areas = areas[nids]
+
+        assert numpy.all(elevs <= limit_elev)
+
+        # we sort the nodes so we can keep the flow network the same
+        descending_indices = numpy.argsort(elevs)[::-1]
+
+        # calculate the offset from max that we assign each node (offsets)
+        epsilon = 0.001
+        offsets = numpy.zeros_like(elevs)
+        # TODO this would be faster with an argsort then index * epsilon
+        offset = 0.0
+        for index in numpy.nditer(descending_indices):
+            offsets[index] = offset
+            offset -= epsilon
+
+        new_elevs = limit_elev + offsets
+
+        dh = new_elevs - elevs
+
+        # if any nodes change by less than epsilon, just zero it; nothing we can do
+        dh[numpy.absolute(dh) <= -offset] = 0.0
+
+        assert numpy.all(dh >= 0.0), 'new %s, old %s offset %s' % (new_elevs, elevs, offsets)
+
+        return numpy.sum(dh * areas)
 
     def _pop_lowest_node(self, elev, unvisited_ids):
         """
@@ -715,15 +745,23 @@ class flowNetwork:
         nodes_in_catchment = set([sink_id])
         visited_nodes = set()
         unvisited_nodes = set([sink_id])
+        raise_height = elev[sink_id]
+        highest_id = None
 
         while len(unvisited_nodes) and volume < max_volume_needed and sill_node_id is None:
             lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_nodes)
             visited_nodes.add(lowest_id)
             lowest_elev = elev[lowest_id]
 
+            if lowest_elev > raise_height:
+                raise_height = lowest_elev
+                highest_id = lowest_id
+
             # NOTE: this scales O(N^2) with node count. There are definitely more efficient algorithms!
-            volume = self._volume_of_nodes(areas, nodes_in_catchment, lowest_elev, elev)
-            assert volume > 0.0 or len(nodes_in_catchment) == 1
+
+            # don't calculate volume including the highest node (we won't be raising it)
+            dnodes = nodes_in_catchment - set([highest_id])
+            volume = self._volume_of_nodes(areas, dnodes, raise_height, elev)
 
             # does it drain into the same catchment?
             if self.receivers[lowest_id] in nodes_in_catchment:
@@ -791,45 +829,57 @@ class flowNetwork:
         # newly raised catchment. All nodes that have been raised are raised at
         # the same time.
         #
-        # IF we have consumed less than the requisite volume of sediment, we
-        # raise the next-lowest node.
-        # IF we have consumed more than enough sediment, we lower all of the
-        # touched nodes by a small amount so as to consume exactly the right
-        # amount of sediment.
-        # IF we run out of nodes to raise and there is still sediment
+        # Once we know which nodes we will raise, we figure out by how much we
+        # raise them. If the capacity of the nodes is sufficient for the amount
+        # of deposition, we raise them exactly the amount required to hold the
+        # deposition.
+        #
+        # NOT IMPLEMENTED:
+        # If we run out of nodes to raise and there is still sediment
         # remaining, we 'top off' the catchment so as to eliminate the
         # depression/sink in it. We then FOR THIS VERSION OF THE ALGORITHM ONLY
         # discard any excess sediment.
 
-        raised_ids = set()  # nodes which have been raised to perform this deposition
-        # touched_ids = set()
+        # nodes which have been raised to perform this deposition
+        raised_ids = set()
         visited_ids = set([sink_id])
         unvisited_ids = set([sink_id])
         dv = deposition_volume[sink_id]
 
         volume = 0.0  # volume of sediment that we have distributed
 
+        highest_id = None
+        raise_elev = -100000.0
         while len(unvisited_ids) and volume < dv:
             # again, prioqueues would help here
             lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_ids)
             lowest_elev = elev[lowest_id]
 
+            if lowest_elev > raise_elev:
+                highest_id = lowest_id
+                raise_elev = lowest_elev
+
             # add any potential neighbours to our 'unvisited' list
-            # this guarantees that the next-lowest node in the catchment is available to be visited
+            # this guarantees that the next-lowest node in the catchment is
+            # available to be visited
             for nid in self._get_pythonic_neighbours(lowest_id, neighbours):
                 if nid not in visited_ids:
                     visited_ids.add(nid)
                     if self._resolve_sink(sinks, nid, elev, sea) == sink_id:
                         unvisited_ids.add(nid)
 
-            # NOTE: this scales O(N^2) with node count. There are definitely more efficient algorithms!
-            volume = self._volume_of_nodes(areas, raised_ids, lowest_elev, elev)
+            # NOTE: this scales O(N^2) with node count. There are definitely
+            # more efficient algorithms!
+            dnodes = raised_ids - set([highest_id])
+            volume = self._volume_of_nodes(areas, dnodes, raise_elev, elev)
 
             if elev[lowest_id] < sea:
                 assert False, 'tried to raise a sea node'
                 # If you reach this, all excess sediment should go into the sea. Don't think it's reachable, though.
 
-            raised_ids.add(lowest_id)
+            if volume < dv:  # we will need to find more nodes
+                raised_ids.add(lowest_id)
+            # if not, this node is our limit
 
         if len(unvisited_ids) == 0 and dv > volume:
             # we ran out of nodes to raise
@@ -837,39 +887,69 @@ class flowNetwork:
         # else, we did not fill the catchment
 
         # work out how to fill the nodes
-        # we go from highest to lowest and assign them all to the elevation of the highest, minus epsilon. This maintains the same drainage structure.
-        # NOTE: there is a slight error in the resulting volume calculation; we will log it for now and try to improve it later.
-        # NOTE: we haven't yet handled the case where the next iteration will try to fill these same nodes as we haven't truly filled the depression.
+        # we go from highest to lowest and assign them all to the elevation of
+        # the highest, minus epsilon. This maintains the same drainage
+        # structure.
+
+        # TODO: we haven't yet handled the case where the next iteration will
+        # try to fill these same nodes as we haven't truly filled the depression.
 
         # pull the raised ids into a list so we can sort them descending by elevation
         raised_ids_array = numpy.array(list(raised_ids))
-        raised_ids_elevs = elev[raised_ids_array]
-        # sort
-        descending_elev_nodes = raised_ids_array[numpy.argsort(raised_ids_elevs)[::-1]]
-        new_elev = elev[descending_elev_nodes[0]]
 
-        # work out how much to change their deposition amount by
-        # we want to raise them all to (highest_elev - count * epsilon)
-        epsilon = 0.00001  # NOTE: we could use next_after, but that is likely to lead to numerical stability issues; we really want the flow network to be preserved
-        allocated_volume = 0.0
-        for nid in numpy.nditer(descending_elev_nodes):
-            new_elev -= epsilon
+        ri_elevs = elev[raised_ids_array]
+        ri_areas = areas[raised_ids_array]
 
+        # we sort the nodes so we can keep the flow network the same
+        descending_indices = numpy.argsort(ri_elevs)[::-1]
 
-            delta = new_elev - elev[nid]
-            delta_volume = delta * areas[nid]
+        # calculate the offset from max that we assign each node (ri_offset)
+        epsilon = 0.001
+        ri_offset = numpy.zeros_like(ri_elevs)
+        offset = 0.0
+        for index in numpy.nditer(descending_indices):
+            ri_offset[index] = offset
+            offset -= epsilon
 
-            if allocated_volume + delta_volume > dv:
-                # scale it back
-                remaining_volume = dv - allocated_volume
-                delta = remaining_volume / areas[nid]
-                delta_volume = remaining_volume
-                break
-            else:
-                allocated_volume += delta_volume
+        # raise the selected nodes by a constant factor
+        # the equations for this are:
+        # new_elevation = raise_factor * current_elevation - offset
+        # fill_amount = new_elevation - current_elevation
+        # where fill_amount is equal to dv
+        # we seek raise_factor
+        # TODO: there's some working to show here
+        newh = (dv - numpy.sum(ri_areas * ri_offset) + numpy.sum(ri_areas * ri_elevs)) / numpy.sum(ri_areas)
 
-            deposition_change[nid] += delta
+        if newh > raise_elev:
+            print 'WARNING: overfill; newh was %s max %s' % (newh, raise_elev)
+            newh = raise_elev - epsilon
 
+        ri_new_elev = newh + ri_offset
+
+        # determine how the depositions change as a result
+        # TODO: check that allocated volume matches what you expect
+        dchange = ri_new_elev - ri_elevs
+
+        dchange[numpy.absolute(dchange) <= -offset] = 0.0  # don't bother with tiny changes
+
+        if numpy.any(dchange < 0.0):
+            print 'WARNING: adjusted dchange %s' % dchange
+            dchange[dchange < 0.0] = 0.0
+
+        # assert numpy.all(dchange >= 0.0), 'dchange %s, raise elev %s newh %s' % (dchange, raise_elev, newh)
+        assert numpy.all(deposition_change[raised_ids_array] == 0.0)
+        deposition_change[raised_ids_array] = dchange
+
+        # DEBUG ONLY: check that we allocated exactly what we expect
+        allocated_volume = numpy.sum(deposition_change[raised_ids_array] * ri_areas)
+        # FIXME: there are still differences between the catchment volume calculation and the final assignment
+        depo_error = allocated_volume - dv
+
+        if abs(depo_error) > 0.01:
+            print 'depo_error = %s, alloc %s, dv %s' % (depo_error, allocated_volume, dv)
+
+        assert numpy.all(dchange >= 0.0), 'new %s, old %s, offset %s, newh %s' % (ri_new_elev, ri_elevs, ri_offset, newh)
+        
     def _lowest_neighbour(self, nid, neighbours, elev, deposition_change):
         # taking into account new deposits, what is the lowest neighbour node?
         # we can't use the existing flow network as our deposits have changed that
@@ -950,6 +1030,7 @@ class flowNetwork:
                     dv -= capacity
                     pass_allocation += capacity
 
+                    assert lowest_elev <= e, 'lowest %s, e %s' % (lowest_elev, e)
 
                     # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
                     if lowest_id == sid or lowest_id in seen_nodes:
@@ -1028,17 +1109,13 @@ class flowNetwork:
                 # Node erosion rate (SPL): Braun 2013 eqn (2), measured in HEIGHT per year
                 rate -= self.erodibility[donor] * self.discharge[donor] ** self.m * (dh / dist) ** self.n
 
-            depo_rate = abs(rate)
-            if rate > 0.0:
-                depo_id = recvr
-            elif rate <= 0.0:
+            if rate <= 0.0:
                 erosion_rate[donor] = rate  # we erode material from the donor...  (HEIGHT per year)
-                depo_id = donor
 
             # We will deposit the same amount, but we need to work out where to deposit it.
             # Find the sink node (bottom point) for the receiver in question?
-            sink_id = self._resolve_sink(sinks, depo_id, elev, sea)
-            deposition_volume_rate[sink_id] += depo_rate * areas[donor]  # VOLUME per year
+            sink_id = self._resolve_sink(sinks, donor, elev, sea)
+            deposition_volume_rate[sink_id] += abs(rate) * areas[donor]  # VOLUME per year
 
         # No erosion or deposition on the borders
         border_flags = (self.xycoords[:, 0] < xymin[0]) | (self.xycoords[:, 1] < xymin[1]) | (self.xycoords[:, 0] > xymax[0]) | (self.xycoords[:, 1] > xymax[1])
@@ -1059,12 +1136,13 @@ class flowNetwork:
 
         # The only land nodes with positive deposition should be sink nodes.
         # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
-        land_sinks = numpy.argwhere(numpy.logical_and(deposition_volume > 0.0, elev >= sea))
+        land_sinks = numpy.where((deposition_volume > 0.0) & (elev >= sea))[0]
+
         catchment_volume = {}  # sink_id: catchment volume
         catchment_sill = {}  # sink_id: sill node id for that catchment
 
         # Work out the catchment volume of each sink - land only
-        for sink_id_array in land_sinks:
+        for sink_id_array in numpy.nditer(land_sinks):
             sink_id = int(sink_id_array)
 
             # NOTE: if we spill deposition later, this will need to be changed as we could have EVEN MORE deposition to apply
@@ -1077,7 +1155,7 @@ class flowNetwork:
         # We also resolve all deposition in a single pass
 
         deposition_change = numpy.zeros_like(elev_change)
-        for sink_id_array in land_sinks:
+        for sink_id_array in numpy.nditer(land_sinks):
             sink_id = int(sink_id_array)
             assert deposition_change[sink_id] == 0
             self._distribute_sediment_land(sink_id, deposition_change=deposition_change, elev=new_elev, deposition_volume=deposition_volume, sill_id=catchment_sill, sinks=sinks, areas=areas, neighbours=neighbours, sea=sea)
