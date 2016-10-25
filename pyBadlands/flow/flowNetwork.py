@@ -671,6 +671,8 @@ class flowNetwork:
         """
         Returns the volume of the nodes specified in node_id_set up to the
         limit elevation.
+
+        If any nodes have elevations above the limit, they are not considered.
         """
 
         # FIXME: this is copy-pasted from the land sedimentation function
@@ -679,11 +681,12 @@ class flowNetwork:
             return 0.0
 
         nids = numpy.array(list(node_id_set))
+        nids = nids[elev[nids] < limit_elev]  # remove nodes which are above limit
 
         elevs = elev[nids]
         areas = areas[nids]
 
-        assert numpy.all(elevs <= limit_elev)
+        assert numpy.all(elevs <= limit_elev), 'elevs %s, limit %s' % (elevs, limit_elev)
 
         # we sort the nodes so we can keep the flow network the same
         descending_indices = numpy.argsort(elevs)[::-1]
@@ -693,7 +696,7 @@ class flowNetwork:
         offsets = numpy.zeros_like(elevs)
         # TODO this would be faster with an argsort then index * epsilon
         offset = 0.0
-        for index in numpy.nditer(descending_indices):
+        for index in numpy.nditer(descending_indices, flags=('zerosize_ok',)):
             offsets[index] = offset
             offset -= epsilon
 
@@ -806,6 +809,10 @@ class flowNetwork:
         sink_id = resolve_sink(self.receivers, sinks, nid, sea, elev)
         assert sink_id >= 0
         return sink_id
+
+    def _each_neighbour_of(self, nid, neighbours):
+        neigh = neighbours[nid]
+        return numpy.nditer(neigh[neigh >= 0])
 
     def _distribute_sediment_land(self, sink_id, elev, sill_id, deposition_change, deposition_volume, sinks, areas, neighbours, sea):
         """
@@ -1038,7 +1045,6 @@ class flowNetwork:
 
                         # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                         if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
-                            # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
                             print 'WARNING: undersea discard of volume %s' % dv
                             break
 
