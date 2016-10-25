@@ -850,102 +850,139 @@ class flowNetwork:
         # nodes which have been raised to perform this deposition
         raised_ids = set()
         visited_ids = set([sink_id])
+        # TODO: unvisited_ids = prioqueue of nodes ordered from lowest to highest
         unvisited_ids = set([sink_id])
         dv = deposition_volume[sink_id]
+
+        exploration_maxh = elev[sink_id]
+        sill_maxh = 10000000.0  # FIXME: use a better constant for infinity
+        sill_id = None  # we use this in the overfill case
 
         volume = 0.0  # volume of sediment that we have distributed
 
         highest_id = None
-        raise_elev = -100000.0
         while len(unvisited_ids) and volume < dv:
-            # again, prioqueues would help here
+            # TODO: prioqueues would help here
+            # pop lowest id in queue
             lowest_id = self._pop_lowest_node(elev=elev, unvisited_ids=unvisited_ids)
             lowest_elev = elev[lowest_id]
 
-            if lowest_elev > raise_elev:
-                highest_id = lowest_id
-                raise_elev = lowest_elev
+            '''
+            we iterate over nodes from lowest to highest
+            when we visit a node, we check all of its neighbours
+                if a neighbour is part of the catchment, we add it to the prioqueue to examine later
+                if it is NOT part of the catchment, it is a sill
+                    we determine our lowest sill elev based on its elev
+
+                our minraise is now the elev of this node - we can raise to AT MOST this high based on what we know about
+                our maxraise is the LOWEST sill elevation
+
+                if we can accomodate all sediment using the minraise constraint, we stop searching
+                if we run out of nodes to search, the lowest sill determines the raise height
+            '''
+
+            # TODO: I'm waiving this constraint temporarily, but there's something odd going on
+            # Sometimes node receivers go uphill (the elevation increases from donor->recvr) which I don't think should happen
+            # if not(lowest_elev >= exploration_maxh):
+                # import pdb; pdb.set_trace()
+            # assert lowest_elev >= exploration_maxh, 'le %s, em %s' % (lowest_elev, exploration_maxh)
+            # exploration_maxh = lowest_elev
+            exploration_maxh = max(lowest_elev, exploration_maxh)
 
             # add any potential neighbours to our 'unvisited' list
             # this guarantees that the next-lowest node in the catchment is
             # available to be visited
-            for nid in self._get_pythonic_neighbours(lowest_id, neighbours):
-                if nid not in visited_ids:
-                    visited_ids.add(nid)
-                    if self._resolve_sink(sinks, nid, elev, sea) == sink_id:
-                        unvisited_ids.add(nid)
+            for nid in self._each_neighbour_of(lowest_id, neighbours):
+                inid = int(nid)
+                if inid not in visited_ids:
+                    visited_ids.add(inid)
+                    if self._resolve_sink(sinks, inid, elev, sea) == sink_id:
+                        unvisited_ids.add(inid)
+                    else:
+                        # it's a sill node; does it restrict our maxh?
+                        if elev[inid] < sill_maxh:
+                            sill_maxh = elev[inid]
+                            sill_id = inid
 
+            maxh = min(sill_maxh, exploration_maxh)
+
+            # What is the new capacity of the catchment based on our known constraints?
             # NOTE: this scales O(N^2) with node count. There are definitely
             # more efficient algorithms!
-            dnodes = raised_ids - set([highest_id])
-            volume = self._volume_of_nodes(areas, dnodes, raise_elev, elev)
-
-            if elev[lowest_id] < sea:
-                assert False, 'tried to raise a sea node'
-                # If you reach this, all excess sediment should go into the sea. Don't think it's reachable, though.
+            volume = self._volume_of_nodes(areas, raised_ids, maxh, elev)
 
             if volume < dv:  # we will need to find more nodes
                 raised_ids.add(lowest_id)
             # if not, this node is our limit
 
-        if len(unvisited_ids) == 0 and dv > volume:
-            # we ran out of nodes to raise
-            print 'DISCARDING SEDIMENT volume %s on top of %s' % (dv - volume, volume)
-        # else, we did not fill the catchment
-
         # work out how to fill the nodes
-        # we go from highest to lowest and assign them all to the elevation of
-        # the highest, minus epsilon. This maintains the same drainage
-        # structure.
-
-        # TODO: we haven't yet handled the case where the next iteration will
-        # try to fill these same nodes as we haven't truly filled the depression.
 
         # pull the raised ids into a list so we can sort them descending by elevation
         raised_ids_array = numpy.array(list(raised_ids))
 
-        ri_elevs = elev[raised_ids_array]
-        ri_areas = areas[raised_ids_array]
+        if dv > volume:
+            # We're going to overfill the catchment, so set up a slope away from the drain point.
+            # We use the straight line distance from the sill to the current node to determine the new height of the node.
+            # This isn't appropriate for all models.
 
-        # we sort the nodes so we can keep the flow network the same
-        descending_indices = numpy.argsort(ri_elevs)[::-1]
+            for nid in raised_ids:
+                # only used for assertion later
+                ri_areas = areas[raised_ids_array]
 
-        # calculate the offset from max that we assign each node (ri_offset)
-        epsilon = 0.001
-        ri_offset = numpy.zeros_like(ri_elevs)
-        offset = 0.0
-        for index in numpy.nditer(descending_indices):
-            ri_offset[index] = offset
-            offset -= epsilon
+                # what's the distance from nid to sill_id?
+                dist = numpy.sqrt(numpy.sum(numpy.power(self.xycoords[nid] - self.xycoords[sill_id], 2)))
+                nid_raise = dist * 0.000005  # guess factor - we want about 0.001 raise per node
+                assert deposition_change[nid] == 0.0
+                assert nid_raise >= 0.0
+                deposition_change[nid] = nid_raise
 
-        # raise the selected nodes by a constant factor
-        # the equations for this are:
-        # new_elevation = raise_factor * current_elevation - offset
-        # fill_amount = new_elevation - current_elevation
-        # where fill_amount is equal to dv
-        # we seek raise_factor
-        # TODO: there's some working to show here
-        newh = (dv - numpy.sum(ri_areas * ri_offset) + numpy.sum(ri_areas * ri_elevs)) / numpy.sum(ri_areas)
+            # There is a slight chance that there is not enough sediment to fill the new structure. This will be detected and flagging at the end of this function.
+        else:
+            # We fill all of the nodes to the same elevation, but subtract a small offset based on their current elevation order. This ensures that the drainage network stays intact and we do not introduce any new depressions.
 
-        if newh > raise_elev:
-            print 'WARNING: overfill; newh was %s max %s' % (newh, raise_elev)
-            newh = raise_elev - epsilon
+            ri_elevs = elev[raised_ids_array]
+            ri_areas = areas[raised_ids_array]
 
-        ri_new_elev = newh + ri_offset
+            # we sort the nodes so we can keep the flow network the same
+            descending_indices = numpy.argsort(ri_elevs)[::-1]
 
-        # determine how the depositions change as a result
-        # TODO: check that allocated volume matches what you expect
-        dchange = ri_new_elev - ri_elevs
+            # calculate the offset from max that we assign each node (ri_offset)
+            epsilon = 0.001
+            ri_offset = numpy.zeros_like(ri_elevs)
+            offset = 0.0
+            for index in numpy.nditer(descending_indices):
+                ri_offset[index] = offset
+                offset -= epsilon
 
-        dchange[numpy.absolute(dchange) <= -offset] = 0.0  # don't bother with tiny changes
+            # raise the selected nodes by a constant factor
+            # the equations for this are:
+            # new_elevation = raise_factor * current_elevation - offset
+            # fill_amount = new_elevation - current_elevation
+            # where fill_amount is equal to dv
+            # we seek raise_factor
+            # TODO: there's some working to show here
+            newh = (dv - numpy.sum(ri_areas * ri_offset) + numpy.sum(ri_areas * ri_elevs)) / numpy.sum(ri_areas)
 
-        if numpy.any(dchange < 0.0):
-            print 'WARNING: adjusted dchange %s' % dchange
-            dchange[dchange < 0.0] = 0.0
+            if newh > (maxh - epsilon):
+                print 'WARNING: overfill; newh was %s max %s' % (newh, maxh)
+                newh = maxh - epsilon
 
-        # assert numpy.all(dchange >= 0.0), 'dchange %s, raise elev %s newh %s' % (dchange, raise_elev, newh)
-        assert numpy.all(deposition_change[raised_ids_array] == 0.0)
-        deposition_change[raised_ids_array] = dchange
+            ri_new_elev = newh + ri_offset
+
+            # determine how the depositions change as a result
+            # TODO: check that allocated volume matches what you expect
+            dchange = ri_new_elev - ri_elevs
+
+            dchange[numpy.absolute(dchange) <= -offset] = 0.0  # don't bother with tiny changes
+
+            if numpy.any(dchange < 0.0):
+                print 'WARNING: adjusted dchange'
+                dchange[dchange < 0.0] = 0.0
+
+            assert numpy.all(deposition_change[raised_ids_array] == 0.0)
+            deposition_change[raised_ids_array] = dchange
+
+            assert numpy.all(dchange >= 0.0), 'new %s, old %s, offset %s, newh %s' % (ri_new_elev, ri_elevs, ri_offset, newh)
 
         # DEBUG ONLY: check that we allocated exactly what we expect
         allocated_volume = numpy.sum(deposition_change[raised_ids_array] * ri_areas)
@@ -953,10 +990,8 @@ class flowNetwork:
         depo_error = allocated_volume - dv
 
         if abs(depo_error) > 0.01:
-            print 'depo_error = %s, alloc %s, dv %s' % (depo_error, allocated_volume, dv)
+            print 'WARNING: land discard allocated %s, total %s' % (allocated_volume, dv)
 
-        assert numpy.all(dchange >= 0.0), 'new %s, old %s, offset %s, newh %s' % (ri_new_elev, ri_elevs, ri_offset, newh)
-        
     def _lowest_neighbour(self, nid, neighbours, elev, deposition_change):
         # taking into account new deposits, what is the lowest neighbour node?
         # we can't use the existing flow network as our deposits have changed that
@@ -1124,9 +1159,9 @@ class flowNetwork:
             deposition_volume_rate[sink_id] += abs(rate) * areas[donor]  # VOLUME per year
 
         # No erosion or deposition on the borders
-        border_flags = (self.xycoords[:, 0] < xymin[0]) | (self.xycoords[:, 1] < xymin[1]) | (self.xycoords[:, 0] > xymax[0]) | (self.xycoords[:, 1] > xymax[1])
-        erosion_rate[border_flags] = 0.0
-        deposition_volume_rate[border_flags] = 0.0
+        # border_flags = (self.xycoords[:, 0] < xymin[0]) | (self.xycoords[:, 1] < xymin[1]) | (self.xycoords[:, 0] > xymax[0]) | (self.xycoords[:, 1] > xymax[1])
+        # erosion_rate[border_flags] = 0.0
+        # deposition_volume_rate[border_flags] = 0.0
 
         # elev_change is the elevation change given the known timestep
         elev_change = erosion_rate * dt
@@ -1171,7 +1206,7 @@ class flowNetwork:
         elev_change += deposition_change
 
         # No erosion or deposition on the borders
-        elev_change[border_flags] = 0.0
+        # elev_change[border_flags] = 0.0
 
         return elev_change, dt
 
