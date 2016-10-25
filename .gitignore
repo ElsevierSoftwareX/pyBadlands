@@ -15,4 +15,4 @@ output_*
 __MACOSX
 .DS_Store
 *.dSYM
-
+output/
