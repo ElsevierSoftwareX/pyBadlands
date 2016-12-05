@@ -991,66 +991,127 @@ class flowNetwork:
         '''
 
         unresolved_ids = numpy.where((deposition_volume > 0.0) & (elev < sea))[0]
-        for sid in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
+        for unresolved_id_array in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
+            unresolved_id = int(unresolved_id_array)
+
             # how much sediment do we need to deposit on it?
             # dv tracks how much sediment remains to be deposited
-            dv = deposition_volume[sid]
+            dv = deposition_volume[unresolved_id]
 
-            maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
+            print 'undersea resolve %s to node %s' % (dv, unresolved_id)
 
-            # simple algorithm for now: we try all of the original neighbours but don't explore the flow network fully otherwise
-            starting_sid = sid
-            pass_allocation = 0.0
+            # dictionary: {node_id: donor elev}
+            # TODO: for perf, this should be a prioqueue
+            # we will add to this as we discover new sinks and choose the highest to deposit to
+            potential_sinks = {unresolved_id: sea}
+            seen_sinks = set([unresolved_id])  # set of ids that have been added to potential_sinks at some point
 
-            # We can get nodes that are very close together, within the 0.95 threshold. They will accept no deposition but we will bounce between them thinking they are
-            seen_nodes = set()
+            # while we have somewhere to deposit to and there is still deposition remaining...
+            while len(potential_sinks.items()) > 0 and dv > 0.0:
+                pass_allocation = 0.0
 
-            # until all of this donor's deposition is resolved
-            while True:  # we will explicitly break from the loop
-                e = elev[sid]
-                # on each step, raise to almost as high to retain slopes everywhere
-                maxh = min(maxh, e + 0.95 * (maxh - e))
-                a = areas[sid]
+                # choose our deposition source
+                # we want the highest node out of potential_sinks
+                start_id = potential_sinks.keys()[0]
+                start_donorh = potential_sinks[start_id]
+                start_elev = elev[start_id]
+                for nid, donorh in potential_sinks.items():
+                    if elev[nid] > start_elev:
+                        start_id = nid
+                        start_elev = elev[nid]
+                        start_donorh = donorh
+                del potential_sinks[start_id]
 
-                # the most we can raise this node
-                maxraise = maxh - e
-                if maxraise < 0.0:
-                    maxraise = 0.0
-                capacity = maxraise * a
+                # print '\ttry start sink %s' % start_id
 
-                if capacity - dv > 0:  # if it all fits
-                    # fill a bit and carry on
-                    elev[sid] += dv / a
-                    break
-                else:
-                    # It doesn't all fit. Where are we going to deposit the remainder to?
-                    lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev)
+                # Starting at start_id and rolling down the hill, try to fill each node up to 95% of its parent
 
-                    # Assign what we can
-                    elev[sid] += maxraise
-                    dv -= capacity
-                    pass_allocation += capacity
+                # We can get nodes that are very close together, within the 95% threshold. They will accept no deposition but we will bounce between them thinking they are
+                seen_nodes = set()
 
-                    assert lowest_elev <= e, 'lowest %s, e %s' % (lowest_elev, e)
+                sid = start_id
+                maxh = start_donorh
 
-                    # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
-                    if lowest_id == sid or lowest_id in seen_nodes:
-                        # We're at a sink node. Bounce back up to the start and try descending the flow network again.
+                # loop until we can't resolve any more deposition starting at start_id
+                while True:  # we will explicitly break from the loop
+                    # print '\t\tdescend %s' % sid
+                    e = elev[sid]
+                    # on each step, raise to almost as high to retain slopes everywhere
+                    maxh = min(maxh, e + 0.95 * (maxh - e))
+                    a = areas[sid]
 
-                        # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
-                        if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
-                            print 'WARNING: undersea discard of volume %s' % dv
-                            break
+                    # the most we can raise this node
+                    maxraise = maxh - e
+                    if maxraise < 0.0:
+                        maxraise = 0.0
+                    capacity = maxraise * a
 
-                        # go back to the start and try again
-                        sid = starting_sid
-                        pass_allocation = 0.0
-                        maxh = sea  # at the start of the chain, raise to sea level (minus epsilon)
+                    if capacity - dv > 0:  # if it all fits
+                        # fill a bit and carry on
+                        elev[sid] += dv / a
+                        dv = 0.0
+                        # print '\t\t\tit all fits!'
+                        break
                     else:
-                        seen_nodes.add(int(sid))
-                        sid = lowest_id
+                        # It doesn't all fit
 
+                        # Assign what we can
+                        elev[sid] += maxraise
+                        dv -= capacity
+                        print '\t\t\tallocate %s, dv is %s' % (capacity, dv)
+                        pass_allocation += capacity
+
+                        # Record all of the neighbours lower than us as potential sinks
+                        neigh = neighbours[sid]
+                        neigh = neigh[neigh >= 0]  # remove sentinels
+                        neigh = neigh[elev[neigh] < elev[sid]]  # remove nodes that are uphill
+
+                        # print '\t\t\t%s neighbours' % (neigh.shape,)
+
+                        for nid_array in numpy.nditer(neigh, flags=('zerosize_ok',)):
+                            nid = int(nid_array)
+                            if nid not in seen_sinks:
+                                # print '\t\t\tadd %s' % nid
+                                seen_sinks.add(nid)
+
+                                exists = nid in potential_sinks.keys()
+                                # if it's not already in potentials, OR we can get a more generous elevation from this node
+                                if not exists or (exists and maxh > potential_sinks[nid]):
+                                    # print '\t\t\tpotential %s %s' % (nid, maxh)
+                                    potential_sinks[nid] = maxh
+
+                        # Where are we going to deposit the remainder to?
+                        lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev)
+
+                        assert lowest_elev <= elev[sid], 'lowest %s, e %s' % (lowest_elev, e)
+
+                        # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
+                        if lowest_id == sid or lowest_id in seen_nodes:
+                            # We're at a sink node. Bounce back up to the start and try descending the flow network again.
+
+                            # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
+                            if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
+                                # no more deposition starting from start_id
+                                break
+
+                            # go back to the start and try again
+                            sid = start_id
+                            pass_allocation = 0.0
+                            maxh = start_donorh  # at the start of the chain, raise to sea level (minus epsilon)
+                            # print '\t\t\trepeat %s' % sid
+                        else:
+                            seen_nodes.add(int(sid))
+                            sid = lowest_id
+
+            if dv > 0.1:
+                print 'WARNING: undersea discard of volume %s' % dv
+                raise ''
+
+                # DEBUG: just make a spike so we can see what's going on
+                # elev[unresolved_id] += 100000
         # TODO: make sure erosion doesn't push a node under the sea level
+
+        # TODO: instead of calculating receivers constantly, every time you modify elev, you could update the relevant parts of receivers and use that instead. You just need to mark the nodes that you modify as dirty, update them and update any nodes that point to them.
 
     def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours):
         '''
