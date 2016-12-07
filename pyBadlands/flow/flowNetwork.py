@@ -567,7 +567,7 @@ class flowNetwork:
         sedFluxes = numpy.zeros_like(elev)
 
         # for each node in RANDOM ORDER, we iterate over FLOWS from donor to receiver
-        print 'there are %s nodes' % len(self.localstack)
+        # print 'there are %s nodes' % len(self.localstack)
         for stack_index in range(len(self.localstack) - 1, -1, -1):
             # print 'index %s' % stack_index
             SPL = 0.
@@ -930,10 +930,15 @@ class flowNetwork:
                 # we're going to overfill to another catchment
                 # we know the sill node
                 # what is the sill node's sink? that's where the surplus will end up
-                assert sill_id is not None
-                overfill_sink_id = self._resolve_sink(sinks, sill_id, elev, sea)
-                assert overfill_sink_id is not None
-                print 'overflow to dest %s sill id %s' % (overfill_sink_id, sill_id)
+
+                # assert sill_id is not None
+                if sill_id is None:
+                    print 'WARNING: discarded overfill of volume %s' % '???'
+                else:
+                    overfill_sink_id = self._resolve_sink(sinks, sill_id, elev, sea)
+                    assert overfill_sink_id is not None
+                    print 'overflow to dest %s sill id %s' % (overfill_sink_id, sill_id)
+                    print "OVERFILL - doesn't look fully implemented"
 
             ri_new_elev = newh + ri_offset
 
@@ -990,128 +995,167 @@ class flowNetwork:
         elev (inout) is updated after resolution.
         '''
 
+        # print 'FIXME no undersea depo'
+        # return 
+
+        def raise_node(nid, max_elev, max_volume):
+            """
+            Raises a node as high as possible given an elevation and volume
+            constraint. Updates the elev array and returns the volume of
+            sediment consumed. Does nothing if the new elevation is below the
+            existing elevation.
+            """
+            a = areas[nid]
+
+            # TODO this should take dv as a parameter and only fill to at most dv
+            old_elev = elev[nid]
+
+            # how much volume will we consume?
+            trial_elev = old_elev + max_volume / a
+            # print '\t\ti want trial %s' % trial_elev
+
+            # what's the new elevation given our constraints?
+            new_elev = min(trial_elev, max_elev)
+
+            # print '\t\traise id %s from %s to max %s, volume %s; solution %s' % (nid, old_elev, max_elev, max_volume, new_elev)
+
+            if new_elev <= old_elev:
+                return 0.0
+
+            elev[nid] = new_elev
+            return (new_elev - old_elev) * a
+
+        '''
+        for each deposition point
+            do a breadth-first search and deposit as much sediment as possible as quickly as possible
+                breadth-first on downhill nodes
+            on each iteration of the search, only go to 95% of the previous iteration's elevation
+            if the dh is less than 5%, don't bother depositing, but traverse over it (this might get slow)
+            find your notes to see what to do about raising nodes above sea level; perhaps just the shore node gets raised to sea level? 
+
+            on each iteration, find ALL of the dest nodes. if they can accomodate the flow, distribute evenly among them; otherwise continue to the next level of traversal
+            '''
+
         unresolved_ids = numpy.where((deposition_volume > 0.0) & (elev < sea))[0]
+        # print 'n unresolved %s total %s' % (unresolved_ids.shape, elev.shape)
+        # raise ''
         for unresolved_id_array in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
             unresolved_id = int(unresolved_id_array)
 
-            # how much sediment do we need to deposit on it?
+            # If this is set, we fill above sea level (such as if there is a
+            # closed catchment undersea that fills beyond capacity)
+            fill_undersea_catchment = False
+
             # dv tracks how much sediment remains to be deposited
             dv = deposition_volume[unresolved_id]
+            # print 'unresolved %sV at %s' % (dv, unresolved_id)
 
-            print 'undersea resolve %s to node %s' % (dv, unresolved_id)
+            # We assume that these (unresolved) points are where the land->sea
+            # transition occurs. We can raise them above sea level to model
+            # coastline migration.
+            # FIXME: we don't do this because diffusion might push random points above sea level; for now we just leave the deposition point undersea
+            # FIXME: somehow we need to mark the land->sea transition flows and use that to decide which nodes can raise above sea level
+            # FIXME: also note that this introduces a dependency on the number of iterations; more iterations means more nodes above sea level, which doesn't make any physical sense
+            max_elev = sea  # normally we only raise this node to exactly sea level
+            # TODO
+            # if fill_undersea_catchment:  # if we're overfilling, it can go as high as the next highest neighbour
+            #     max_elev = 
+            volume = raise_node(nid=unresolved_id, max_elev=sea, max_volume=dv)
+            dv -= volume
 
-            # dictionary: {node_id: donor elev}
-            # TODO: for perf, this should be a prioqueue
-            # we will add to this as we discover new sinks and choose the highest to deposit to
-            potential_sinks = {unresolved_id: sea}
-            seen_sinks = set([unresolved_id])  # set of ids that have been added to potential_sinks at some point
+            # to prevent loops, we don't visit the same node twice
+            seen_ids = set([unresolved_id])
 
-            # while we have somewhere to deposit to and there is still deposition remaining...
-            while len(potential_sinks.items()) > 0 and dv > 0.0:
-                pass_allocation = 0.0
+            donor_ids = [unresolved_id]
 
-                # choose our deposition source
-                # we want the highest node out of potential_sinks
-                start_id = potential_sinks.keys()[0]
-                start_donorh = potential_sinks[start_id]
-                start_elev = elev[start_id]
-                for nid, donorh in potential_sinks.items():
-                    if elev[nid] > start_elev:
-                        start_id = nid
-                        start_elev = elev[nid]
-                        start_donorh = donorh
-                del potential_sinks[start_id]
+            # Each iteration of this loop represents one more node traversal
+            # from the initial deposition point.
+            #
+            # Sometimes we get trivially small (1e-10) volume of sediment that
+            # is difficult to deposit; the threshold reduces the chance that
+            # we will waste time searching for a destination
 
-                # print '\ttry start sink %s' % start_id
+            while dv > 0.1:
+                # on this iteration, this is the list of ids that we can deposit to
+                receiver_ids = set()
 
-                # Starting at start_id and rolling down the hill, try to fill each node up to 95% of its parent
+                # maximum elev for this iteration is the worse-case elev of all donor nodes
+                # TODO: slightly more optimistic would be, for each receiver node, to take the minimum of the connected donor nodes, not all nodes in the iteration
+                iteration_elev = numpy.min(elev[list(donor_ids)])
+                if fill_undersea_catchment:
+                    iteration_elev = sea
+                print '\titer up to %s' % iteration_elev
 
-                # We can get nodes that are very close together, within the 95% threshold. They will accept no deposition but we will bounce between them thinking they are
-                seen_nodes = set()
+                # find all of the potential donors
+                # we can deposit to a node which is downslope
+                for did in donor_ids:
+                    potential_ids = self._get_pythonic_neighbours(did, neighbours)
+                    potential_elevs = elev[potential_ids]
+                    # downslope_ids = potential_ids[potential_elevs < iteration_elev]
+                    # NOTE: we're just diffusing to anything that is undersea without regard for the slope underneath
+                    downslope_ids = potential_ids[potential_elevs < sea]
 
-                sid = start_id
-                maxh = start_donorh
+                    # print 'did %s potential ids are %s, their elevs are %s, iter elev %s, we filtered to %s' % (did, potential_ids, potential_elevs, iteration_elev, downslope_ids)
 
-                # loop until we can't resolve any more deposition starting at start_id
-                while True:  # we will explicitly break from the loop
-                    # print '\t\tdescend %s' % sid
-                    e = elev[sid]
-                    # on each step, raise to almost as high to retain slopes everywhere
-                    maxh = min(maxh, e + 0.95 * (maxh - e))
-                    a = areas[sid]
+                    # import ipdb; ipdb.set_trace()
 
-                    # the most we can raise this node
-                    maxraise = maxh - e
-                    if maxraise < 0.0:
-                        maxraise = 0.0
-                    capacity = maxraise * a
+                    # store any nodes that we haven't already seen
+                    for nid in downslope_ids:
+                        if nid not in seen_ids:
+                            receiver_ids.add(nid)
+                            seen_ids.add(nid)
 
-                    if capacity - dv > 0:  # if it all fits
-                        # fill a bit and carry on
-                        elev[sid] += dv / a
-                        dv = 0.0
-                        # print '\t\t\tit all fits!'
-                        break
+                if len(receiver_ids) == 0:
+                    if fill_undersea_catchment is False:
+                        # If we exhaust the whole catchment, we start filling to above sea level
+                        # We set the fill_undersea_catchment flag and repeat the process
+                        print 'WARNING: filling undersea catchment'
+                        fill_undersea_catchment = True
+                        # reset
+                        seen_ids = set([unresolved_id])
+                        donor_ids = [unresolved_id]
+                        continue
                     else:
-                        # It doesn't all fit
+                        # The catchment is full. All we can do now is kick the
+                        # excess back to the land sediment algorithm
+                        # import ipdb; ipdb.set_trace()
+                        # assert False, 'too much'
+                        print "WARNING: filled undersea catchment. Need to bounce this back to land algo."
+                        # potentially, you could call it directly at this stage; make sure any undersea changes that *it* makes are handled
 
-                        # Assign what we can
-                        elev[sid] += maxraise
-                        dv -= capacity
-                        print '\t\t\tallocate %s, dv is %s' % (capacity, dv)
-                        pass_allocation += capacity
+                        # you need to return this out of the function or keep the deposition_volume figures up to date
+                        # in the calling function you would then have a loop between land and sea, iterating until all deposition has been resolved
+                        dv = 0.0
+                        break
 
-                        # Record all of the neighbours lower than us as potential sinks
-                        neigh = neighbours[sid]
-                        neigh = neigh[neigh >= 0]  # remove sentinels
-                        neigh = neigh[elev[neigh] < elev[sid]]  # remove nodes that are uphill
 
-                        # print '\t\t\t%s neighbours' % (neigh.shape,)
+                    # print "WARNING: ran out of places to deposit undersea (%s discarded)" % dv
 
-                        for nid_array in numpy.nditer(neigh, flags=('zerosize_ok',)):
-                            nid = int(nid_array)
-                            if nid not in seen_sinks:
-                                # print '\t\t\tadd %s' % nid
-                                seen_sinks.add(nid)
+                    # TEMP: put a spike there so we can debug
+                    # elev[unresolved_id] = 10000.0
+                    # elev[list(receiver_ids)] = -100000.0
+                    # break
 
-                                exists = nid in potential_sinks.keys()
-                                # if it's not already in potentials, OR we can get a more generous elevation from this node
-                                if not exists or (exists and maxh > potential_sinks[nid]):
-                                    # print '\t\t\tpotential %s %s' % (nid, maxh)
-                                    potential_sinks[nid] = maxh
+                # TODO: we should be figuring out the exact amount to raise each node to correctly deposit the right amount of sediment
+                # we'd prefer to deposit evenly among the available receivers
+                # for now, we're just going to iterate through and assign as much as we can to each node and worry about the uneven distribution later
+                for nid in receiver_ids:
+                    e = elev[nid]
+                    new_elev = e + 0.95 * (iteration_elev - e)  # remember, raise_node won't lower a node
+                    if fill_undersea_catchment:
+                        new_elev = sea
 
-                        # Where are we going to deposit the remainder to?
-                        lowest_id, lowest_elev = self._lowest_neighbour(sid, neighbours, elev)
+                    volume = raise_node(nid=nid, max_elev=new_elev, max_volume=dv)
 
-                        assert lowest_elev <= elev[sid], 'lowest %s, e %s' % (lowest_elev, e)
+                    # if volume == 0.0:
+                        # print '\t\tno depo; volume %s dv %s, raise node %s from %s to %s, max %s' % (volume, dv, nid, e, new_elev, iteration_elev)
+                    dv -= volume
+                    if dv <= 0.0:
+                        break
 
-                        # TODO: if this is too slow, you could make a copy of receivers and mutate it along with the changes in elevation so it's a simple lookup here
-                        if lowest_id == sid or lowest_id in seen_nodes:
-                            # We're at a sink node. Bounce back up to the start and try descending the flow network again.
-
-                            # We did an entire traverse and did not manage to allocate any sediment. We're stuck. Give up.
-                            if pass_allocation < 0.1:  # floating point issues can lead to tiny finite depositions but no convergence of the model
-                                # no more deposition starting from start_id
-                                break
-
-                            # go back to the start and try again
-                            sid = start_id
-                            pass_allocation = 0.0
-                            maxh = start_donorh  # at the start of the chain, raise to sea level (minus epsilon)
-                            # print '\t\t\trepeat %s' % sid
-                        else:
-                            seen_nodes.add(int(sid))
-                            sid = lowest_id
-
-            if dv > 0.1:
-                print 'WARNING: undersea discard of volume %s' % dv
-                raise ''
-
-                # DEBUG: just make a spike so we can see what's going on
-                # elev[unresolved_id] += 100000
-        # TODO: make sure erosion doesn't push a node under the sea level
-
-        # TODO: instead of calculating receivers constantly, every time you modify elev, you could update the relevant parts of receivers and use that instead. You just need to mark the nodes that you modify as dirty, update them and update any nodes that point to them.
+                print '\titer complete; %s donors and %s receivers with dv %s' % (len(donor_ids), len(receiver_ids), dv)
+                # reset for next iteration
+                donor_ids = receiver_ids
 
     def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours):
         '''
