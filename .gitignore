@@ -16,3 +16,4 @@ __MACOSX
 .DS_Store
 *.dSYM
 output/
+env/
