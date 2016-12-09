@@ -332,7 +332,7 @@ class flowNetwork:
 
         return
 
-    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, sealevel, cumdiff, neighbours=None):
+    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, rivqs, sealevel, cumdiff, perc_dep, slp_cr, neighbours=None):
         """
         Calculates the sediment flux at each node.
 
@@ -359,11 +359,20 @@ class flowNetwork:
         variable : dt
             Real value corresponding to the maximal stability time step.
 
+        variable : rivqs
+            Numpy arrays representing the sediment fluxes from rivers.
+
         variable : sealevel
             Real value giving the sea-level height at considered time step.
 
         variable : cumdiff
             Numpy array containing the cumulative deposit thicknesses.
+
+        variable : slp_cr
+            Critical slope used to force aerial deposition for alluvial plain.
+
+        variable : perc_dep
+            Maximum percentage of deposition at any given time interval.
         """
 
         # Initialise MPI communications
@@ -372,46 +381,37 @@ class flowNetwork:
         size = comm.Get_size()
 
         # Compute sediment flux using libUtils
+        # Purely erosive case
+        if self.spl and self.depo == 0:
+            sedflux, newdt = FLOWalgo.flowcompute.sedflux_ero_only(self.localstack,self.receivers, \
+                     self.xycoords,xymin,xymax,self.discharge,elev, \
+                     diff_flux,self.erodibility,self.m,self.n,sealevel,dt)
 
-        diff = None  # not all code paths use this, so return None in the default case
+        # Stream power law and mass is not conserved
+        elif self.spl and self.filter:
+            sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity_quick(self.localstack,self.receivers, \
+                     self.xycoords,Acell,xymin,xymax,self.discharge,elev,rivqs,diff_flux,self.erodibility, \
+                     self.m,self.n,sealevel,dt)
+
+        # Stream power law
+        elif self.spl:
+            sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity(self.localstack,self.receivers,self.xycoords, \
+                     Acell,xymin,xymax,self.maxh,self.maxdep,self.discharge,fillH,elev,rivqs,diff_flux, \
+                     self.erodibility,self.m,self.n,perc_dep,slp_cr,sealevel,dt)
+
+        # River carrying capacity case
+        else:
+            sedflux, newdt = FLOWalgo.flowcompute.sedflux_capacity(self.localstack,self.receivers,self.xycoords,\
+                     Acell,xymin,xymax,self.discharge,elev,rivqs,diff_flux,cumdiff,self.erodibility, \
+                     self.m,self.n,self.bedrock,self.alluvial,sealevel,dt)
 
         # Parallel case
         if(size > 1):
-            # Purely erosive case
-            if self.spl and self.depo == 0:
-                sedflux, newdt = FLOWalgo.flowcompute.sedflux_ero_only(self.localstack,self.receivers, \
-                                      self.xycoords,xymin,xymax,self.discharge,elev, \
-                                      diff_flux,self.erodibility,self.m,self.n,sealevel,dt)
-
-            # Stream power law and mass is not conserved
-            elif self.spl and self.filter:
-                sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity_quick(self.localstack,self.receivers, \
-                         self.xycoords,Acell,xymin,xymax,self.discharge,elev,diff_flux,self.erodibility, \
-                         self.m,self.n,sealevel,dt)
-
-            # Stream power law
-            elif self.spl:
-                print "PARALLEL NOT IMPLEMENTED"
-                sedflux, newdt = FLOWalgo.flowcompute.sedflux_nocapacity(self.localstack,self.receivers,self.xycoords, \
-                         Acell,xymin,xymax,self.maxh,self.maxdep,self.discharge,fillH,elev,diff_flux, \
-                         self.erodibility,self.m,self.n,sealevel,dt)
-
-            # River carrying capacity case
-            else:
-                sedflux, newdt = FLOWalgo.flowcompute.sedflux_capacity(self.localstack,self.receivers,self.xycoords,\
-                         Acell,xymin,xymax,self.discharge,elev,diff_flux,cumdiff,self.erodibility, \
-                         self.m,self.n,self.bedrock,self.alluvial,sealevel,dt)
-
             timestep = numpy.zeros(1)
             timestep[0] = newdt
             comm.Allreduce(mpi.IN_PLACE,timestep,op=mpi.MIN)
             newdt = timestep[0]
             comm.Allreduce(mpi.IN_PLACE,sedflux,op=mpi.MAX)
-            tempIDs = numpy.where(sedflux < -9.5e5)
-            sedflux[tempIDs] = 0.
-            newdt = max(self.mindt,newdt)
-            sedrate = sedflux
-
         # Serial case
         else:
             # Purely erosive case
@@ -1084,7 +1084,7 @@ class flowNetwork:
                 iteration_elev = numpy.min(elev[list(donor_ids)])
                 if fill_undersea_catchment:
                     iteration_elev = sea
-                print '\titer up to %s' % iteration_elev
+                # print '\titer up to %s' % iteration_elev
 
                 # find all of the potential donors
                 # we can deposit to a node which is downslope
@@ -1109,7 +1109,7 @@ class flowNetwork:
                     if fill_undersea_catchment is False:
                         # If we exhaust the whole catchment, we start filling to above sea level
                         # We set the fill_undersea_catchment flag and repeat the process
-                        print 'WARNING: filling undersea catchment'
+                        print 'WARNING: filling undersea catchment (dv = %s)' % dv
                         fill_undersea_catchment = True
                         # reset
                         seen_ids = set([unresolved_id])
@@ -1120,7 +1120,7 @@ class flowNetwork:
                         # excess back to the land sediment algorithm
                         # import ipdb; ipdb.set_trace()
                         # assert False, 'too much'
-                        print "WARNING: filled undersea catchment. Need to bounce this back to land algo."
+                        print "WARNING: filled undersea catchment. Need to bounce this back to land algo. (dv = %s)" % dv
                         # potentially, you could call it directly at this stage; make sure any undersea changes that *it* makes are handled
 
                         # you need to return this out of the function or keep the deposition_volume figures up to date
@@ -1153,7 +1153,7 @@ class flowNetwork:
                     if dv <= 0.0:
                         break
 
-                print '\titer complete; %s donors and %s receivers with dv %s' % (len(donor_ids), len(receiver_ids), dv)
+                # print '\titer complete; %s donors and %s receivers with dv %s' % (len(donor_ids), len(receiver_ids), dv)
                 # reset for next iteration
                 donor_ids = receiver_ids
 

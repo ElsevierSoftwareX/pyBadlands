@@ -51,7 +51,10 @@ class Model(object):
         seed = self._comm.bcast(seed, root=0)
         np.random.seed(seed)
 
-        self.build_mesh(self.input.demfile, verbose)
+        # If there's no demfile specified, we assume that it will be loaded
+        # later using build_mesh
+        if self.input.demfile:
+            self.build_mesh(self.input.demfile, verbose)
 
     def build_mesh(self, filename, verbose):
 
@@ -113,7 +116,7 @@ class Model(object):
             self.flex.update_flexure_parameters(self.FVmesh.node_coords[:,:2])
 
         # Update stratigraphic mesh
-        if self.input.laytime > 0:
+        if self.input.laytime > 0 and self.strata:
             if self.input.region == 0:
                 self.strata[0].update_TIN(self.FVmesh.node_coords[:, :2])
             else:
@@ -134,11 +137,12 @@ class Model(object):
 
         If profile is True, dump cProfile output to /tmp.
         """
-
         if profile:
             pid = os.getpid()
             pr = cProfile.Profile()
             pr.enable()
+
+        assert hasattr(self, 'recGrid'), "DEM file has not been loaded. Configure one in your XML file or call the build_mesh function."
 
         # Define non-flow related processes times
         if not self.simStarted:
@@ -162,7 +166,6 @@ class Model(object):
 
         # Perform main simulation loop
         while self.tNow < tEnd:
-
             # At most, display output every 5 seconds
             tloop = time.clock() - last_time
             if self._rank == 0 and time.clock() - last_output >= 5.0:
@@ -199,8 +202,10 @@ class Model(object):
                         if self.input.region == 0:
                             regdX = [None]
                             regdY = [None]
-                            updateMesh, regdX[0], regdY[0] = self.force.load_Disp_map(self.tNow, self.FVmesh.node_coords[:, :2], self.inIDs,
-                                                                True, self.strata[0].xyi, self.strata[0].ids)
+                            if self.strata:
+                                updateMesh, regdX[0], regdY[0] = self.force.load_Disp_map(self.tNow, self.FVmesh.node_coords[:, :2], self.inIDs, True, self.strata[0].xyi, self.strata[0].ids)
+                            else:
+                                updateMesh = self.force.load_Disp_map(self.tNow, self.FVmesh.node_coords[:, :2], self.inIDs)
                         else:
                             regdX = [None] * self.input.region
                             regdY = [None] * self.input.region
@@ -220,7 +225,7 @@ class Model(object):
                         # Define stratal flags
                         fstrat = 0
                         sload = None
-                        if self.input.laytime > 0:
+                        if self.input.laytime > 0 and self.strata:
                             sload = self.strata[0].oldload
                             fstrat = 1
                         # Define erodibility map flags
@@ -244,7 +249,7 @@ class Model(object):
                         # Rebuild the computational mesh
                         self.rebuild_mesh()
                         # Update the stratigraphic mesh
-                        if self.input.laytime > 0:
+                        if self.input.laytime > 0 and self.strata:
                             if self.input.region == 0:
                                 self.strata[0].move_mesh(regdX[0], regdY[0], scum, verbose=False)
                             else:
@@ -254,7 +259,6 @@ class Model(object):
             # Compute stream network
             self.fillH, self.elevation = buildFlux.streamflow(self.input, self.FVmesh, self.recGrid, self.force, self.hillslope, \
                                               self.flow, self.elevation, self.lGIDs, self.rain, self.tNow, verbose)
-
             # Compute isostatic flexure
             if self.tNow >= self.force.next_flexure:
                 flextime = time.clock()
@@ -276,9 +280,9 @@ class Model(object):
             if self.tNow >= self.force.next_display:
                 if self.force.next_display > self.input.tStart:
                     outStrata = 1
-                checkPoints.write_checkpoints(self.input, self.recGrid, self.lGIDs, self.inIDs, self.tNow, \
-                                            self.FVmesh, self.tMesh, self.force, self.flow, self.rain, \
-                                            self.elevation, self.cumdiff, self.outputStep, self.mapero, \
+                checkPoints.write_checkpoints(self.input, self.recGrid, self.lGIDs, self.inIDs, self.tNow,
+                                            self.FVmesh, self.tMesh, self.force, self.flow, self.rain,
+                                            self.elevation, self.cumdiff, self.outputStep, self.mapero,
                                             self.cumflex)
                 # Update next display time
                 self.force.next_display += self.input.tDisplay
@@ -288,13 +292,14 @@ class Model(object):
             # Update next stratal layer time
             if self.tNow >= self.force.next_layer:
                 self.force.next_layer += self.input.laytime
-                if self.input.region == 0:
-                    self.strata[0].buildStrata(self.elevation, self.cumdiff, self.force.sealevel,
-                        self._rank, outStrata, self.outputStep-1)
-                else:
-                    for rid in range(self.input.region):
-                        self.strata[rid].buildStrata(self.elevation, self.cumdiff, self.force.sealevel,
+                if self.strata:
+                    if self.input.region == 0:
+                        self.strata[0].buildStrata(self.elevation, self.cumdiff, self.force.sealevel,
                             self._rank, outStrata, self.outputStep-1)
+                    else:
+                        for rid in range(self.input.region):
+                            self.strata[rid].buildStrata(self.elevation, self.cumdiff, self.force.sealevel,
+                                self._rank, outStrata, self.outputStep-1)
                 outStrata = 0
 
             # Get the maximum time before updating one of the above processes / components
@@ -302,8 +307,8 @@ class Model(object):
                         tEnd, self.force.next_disp, self.force.next_rain])
 
             # Compute sediment transport up to tStop
-            self.tNow,self.elevation,self.cumdiff = buildFlux.sediment_flux(self.input, self.recGrid, self.hillslope,
-                              self.FVmesh, self.tMesh, self.flow, self.force, self.applyDisp, self.mapero, self.cumdiff,
+            self.tNow, self.elevation, self.cumdiff = buildFlux.sediment_flux(self.input, self.recGrid, self.hillslope, self.FVmesh,
+                              self.tMesh, self.flow, self.force, self.applyDisp, self.mapero, self.cumdiff, \
                               self.fillH, self.disp, self.inGIDs, self.elevation, self.tNow, tStop, verbose)
 
         tloop = time.clock() - last_time

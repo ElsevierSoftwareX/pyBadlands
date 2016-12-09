@@ -26,12 +26,16 @@ def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
     size = mpi.COMM_WORLD.size
     comm = mpi.COMM_WORLD
 
-    Flow_time = time.clock()
+    flow.Flow_time = time.clock()
 
     # Update sea-level
     walltime = time.clock()
     force.getSea(tNow)
     fillH = None
+
+    # Update river input
+    force.getRivers(tNow)
+    riverrain = rain+force.rivQw
 
     if input.depo == 0 or input.capacity or input.filter:
         flow.maxdep = 0.
@@ -93,7 +97,7 @@ def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
 
     # Compute discharge
     walltime = time.clock()
-    flow.compute_flow(FVmesh.control_volumes, rain)
+    flow.compute_flow(FVmesh.control_volumes, riverrain)
     if rank == 0 and verbose:
         print " -   compute discharge ", time.clock() - walltime
 
@@ -139,9 +143,13 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
         dt_reason = 'flow CFL'
 
     # print '\tflow CFL = %s, hillslope CFL = %s, I choose smallest (%s)' % (flow.CFL, hillslope.CFL, CFLtime)
-    CFLtime = max(input.minDT, CFLtime)
     if input.minDT > CFLtime:
+        CFLtime = input.minDT
         dt_reason = 'minDT'
+
+    if input.maxiDT < CFLtime:
+        dt_reason = 'maxiDT'
+        CFLtime = input.maxiDT
 
     if rank == 0 and verbose:
         print " -   Get CFL time step ", time.clock() - walltime
@@ -156,15 +164,15 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
     walltime = time.clock()
     xyMin = [recGrid.regX.min(), recGrid.regY.min()]
     xyMax = [recGrid.regX.max(), recGrid.regY.max()]
-
+    ids = np.where(force.rivQs>0)
     input_timestep = min(CFLtime, tEnd - tNow)
     # TODO: review this; aren't you doing this as part of sedflux now?
     if input_timestep < CFLtime:
         dt_reason = 'display interval'
-
-    timestep, sedrate, diff = flow.compute_sedflux(FVmesh.control_volumes, elevation, fillH, xyMin, xyMax,
-                                          diff_flux, input_timestep, force.sealevel, cumdiff, neighbours=tMesh.neighbours)
-
+    tmp = force.rivQs[ids]
+    timestep, sedrate, diff = flow.compute_sedflux(FVmesh.control_volumes,
+        elevation, fillH, xyMin, xyMax, diff_flux, input_timestep, force.rivQs,
+        force.sealevel, cumdiff, input.perc_dep, input.slp_cr, neighbours=tMesh.neighbours)
     if timestep < input_timestep:
         dt_reason = 'sedflux'
 
@@ -175,6 +183,13 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
     if np.any(sedrate):
         assert diff is None
         diff = sedrate * timestep
+
+    assert tNow <= tEnd, 'ran off the end of the model'
+    # bodge around floating point issues, make sure time always advances
+    if timestep < 0.0001:
+        if rank == 0:
+            print 'WARNING: timestep is tiny. Your model will take a long time to run.'
+        timestep = 0.0001
 
     if input.filter:
         smthdiff = flow.gaussian_filter(diff)
@@ -196,6 +211,6 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
     tNow += timestep
 
     if rank == 0 and verbose:
-        print " - Flow computation ", time.clock() - Flow_time
+        print " - Flow computation ", time.clock() - flow.Flow_time
 
     return tNow,elevation,cumdiff

@@ -89,6 +89,21 @@ class forceSim:
     float : regY
         Numpy array containing the Y-coordinates of the regular input grid.
 
+    float : rivPos
+        Numpy array containing the XY position of the rivers.
+
+    float : rivTime
+        Numpy array containing the active time for the rivers.
+
+    float : rivQws
+        Numpy array containing the water and sediment discharge for the rivers.
+
+    float : rivWth
+        Numpy array containing the width of the rivers.
+
+    int : rivNb
+        Number of rivers.
+
     float : Tdisplay
         Display interval (in years).
     """
@@ -96,7 +111,8 @@ class forceSim:
     def __init__(self, seafile = None, sea0 = 0., MapRain = None, TimeRain = None, ValRain = None,
                  orographic = None, rbgd = None, rmin = None, rmax = None, windx = None, windy = None,
                  tauc = None, tauf = None, nm = None, cw = None, hw = None, ortime = None, MapDisp = None,
-                 TimeDisp = None, regX = None, regY = None, Tdisplay = 0.):
+                 TimeDisp = None, regX = None, regY = None, rivPos = None, rivTime = None, rivQws = None,
+                 rivWth = None, rivNb = 0, Tdisplay = 0.):
 
         self.regX = regX
         self.regY = regY
@@ -104,6 +120,14 @@ class forceSim:
         self.xyi = numpy.dstack([self.xi.flatten(), self.yi.flatten()])[0]
         self.tree = None
         self.dx = None
+
+        self.rivNb = rivNb
+        self.rivPos = rivPos
+        self.rivTime = rivTime
+        self.rivQws = rivQws
+        self.rivWth = rivWth
+        self.rivQs = None
+        self.rivQw = None
 
         self.Map_rain = MapRain
         self.rainVal = ValRain
@@ -124,6 +148,7 @@ class forceSim:
 
         self.Map_disp = MapDisp
         self.T_disp = TimeDisp
+        self.injected_disps = None
         self.next_disp = None
 
         self.sea0 = sea0
@@ -185,6 +210,48 @@ class forceSim:
             if time > self.seatime.max():
                 time = self.seatime.max()
             self.sealevel = self.seaFunc(time)
+
+        return
+
+    def getRivers(self, time):
+        """
+        Finds for a given time the active rivers and allocates corresponding points with
+        water and sediment discharge values.
+
+        Parameters
+        ----------
+        float : time
+            Requested time for which to compute sea level elevation.
+
+        Return
+        ----------
+        variable: rivQw
+            Numpy array containing flow discharge from rivers.
+
+        variable: rivQs
+            Numpy array containing sediment discharge from rivers.
+        """
+
+        self.rivQw = numpy.zeros(len(self.tXY))
+        self.rivQs = numpy.zeros(len(self.tXY))
+
+        if self.rivNb > 0:
+            active = numpy.where(numpy.logical_and(self.rivTime[:,0] <= time, self.rivTime[:,1] > time))[0]
+            rivNb = len(active)
+            if rivNb > 0:
+                riv_xy = self.rivPos[active,:]
+                radius = self.rivWth[active]
+                indices = self.tree.query_ball_point(riv_xy, radius)
+                for r in range(rivNb):
+                    riv_qw = self.rivQws[active[r],0]
+                    riv_qs = self.rivQws[active[r],1]
+                    if len(indices[r]) > 0:
+                        self.rivQw[indices[r]] += riv_qw / len(indices[r])
+                        self.rivQs[indices[r]] += riv_qs / len(indices[r])
+                    else:
+                        distances, ids = self.tree.query(riv_xy[r], k=1)
+                        self.rivQw[ids] += riv_qw
+                        self.rivQs[ids] += riv_qs
 
         return
 
@@ -370,11 +437,15 @@ class forceSim:
 
         self.next_disp = self.T_disp[event,1]
 
-        if self.Map_disp[event] != None:
-            dispMap = pandas.read_csv(str(self.Map_disp[event]), sep=r'\s+', engine='c', header=None, na_filter=False, \
-                               dtype=numpy.float, low_memory=False)
+        if self.injected_disps is not None or self.Map_disp[event] != None:
+            if self.injected_disps is not None:
+                dispMap = self.injected_disps
+            else:
+                dispMap = pandas.read_csv(str(self.Map_disp[event]), sep=r'\s+', engine='c', header=None, na_filter=False, \
+                                   dtype=numpy.float, low_memory=False).values
 
-            rectDisp = numpy.reshape(dispMap.values,(len(self.regX), len(self.regY)),order='F')
+
+            rectDisp = numpy.reshape(dispMap,(len(self.regX), len(self.regY)),order='F')
             tinDisp = interpolate.interpn( (self.regX, self.regY), rectDisp, self.tXY[inIDs,:], method='linear')
             dt = (self.T_disp[event,1] - self.T_disp[event,0])
             if dt <= 0:
@@ -444,16 +515,22 @@ class forceSim:
             self.next_disp = self.T_disp[event,1]
 
         update = False
-        if self.Map_disp[event] != None:
+        if self.injected_disps is not None or self.Map_disp[event] != None:
             dispX.fill(-1.e6)
             dispY.fill(-1.e6)
             dispZ.fill(-1.e6)
-            disps = pandas.read_csv(str(self.Map_disp[event]), sep=r'\s+', engine='c', header=None, na_filter=False, \
-                               dtype=numpy.float, low_memory=False)
 
-            disprX = numpy.reshape(disps.values[:,0],(len(self.regX), len(self.regY)),order='F')
-            disprY = numpy.reshape(disps.values[:,1],(len(self.regX), len(self.regY)),order='F')
-            disprZ = numpy.reshape(disps.values[:,2],(len(self.regX), len(self.regY)),order='F')
+            if self.injected_disps is not None:
+                dvals = self.injected_disps
+            else:
+                disps = pandas.read_csv(str(self.Map_disp[event]), sep=r'\s+', engine='c', header=None, na_filter=False, \
+                            dtype=numpy.float, low_memory=False)
+                dvals = disps.values
+
+
+            disprX = numpy.reshape(dvals[:,0],(len(self.regX), len(self.regY)),order='F')
+            disprY = numpy.reshape(dvals[:,1],(len(self.regX), len(self.regY)),order='F')
+            disprZ = numpy.reshape(dvals[:,2],(len(self.regX), len(self.regY)),order='F')
             dispX[inIDs] = interpolate.interpn( (self.regX, self.regY), disprX, dpXY, method='linear')
             dispY[inIDs] = interpolate.interpn( (self.regX, self.regY), disprY, dpXY, method='linear')
             dispZ[inIDs] = interpolate.interpn( (self.regX, self.regY), disprZ, dpXY, method='linear')
@@ -470,8 +547,9 @@ class forceSim:
                 comm.Allreduce(mpi.IN_PLACE, sdispX, op=mpi.MAX)
                 comm.Allreduce(mpi.IN_PLACE, sdispY, op=mpi.MAX)
 
-        if self.time3d > 0. and self.Map_disp[event] != None:
+        if self.time3d > 0. and (self.injected_disps is not None or self.Map_disp[event] != None):
             rate = (self.next_disp - time) / (self.T_disp[event,1] - self.T_disp[event,0])
+            assert rate > 0
             dispX = dispX * rate
             dispY = dispY * rate
             dispZ = dispZ * rate
