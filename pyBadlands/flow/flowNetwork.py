@@ -993,10 +993,13 @@ class flowNetwork:
         deposition_volume (inout) reflects the initial or 'requested'
             deposition state where some nodes will have too much sediment.
         elev (inout) is updated after resolution.
+
+        Returns False if the land sediment algorithm needs to be called again
+        (because sediment has risen above sea level and cannot be resolved
+        here)
         '''
 
-        # print 'FIXME no undersea depo'
-        # return 
+        all_resolved = True  # if there are undersea overfills, set this to False
 
         def raise_node(nid, max_elev, max_volume):
             """
@@ -1037,35 +1040,41 @@ class flowNetwork:
             '''
 
         unresolved_ids = numpy.where((deposition_volume > 0.0) & (elev < sea))[0]
-        # print 'n unresolved %s total %s' % (unresolved_ids.shape, elev.shape)
-        # raise ''
         for unresolved_id_array in numpy.nditer(unresolved_ids, flags=('zerosize_ok',)):
             unresolved_id = int(unresolved_id_array)
 
-            # If this is set, we fill above sea level (such as if there is a
-            # closed catchment undersea that fills beyond capacity)
-            fill_undersea_catchment = False
+            unresolved_elev = elev[unresolved_id]
+            # Nodes can be pushed above sea level before we get to resolve them. The land depo algorithm must deal with them.
+            if unresolved_elev >= sea:
+                continue
+
+            max_distance = 0.0
+            max_distance_id = unresolved_id
 
             # dv tracks how much sediment remains to be deposited
             dv = deposition_volume[unresolved_id]
-            # print 'unresolved %sV at %s' % (dv, unresolved_id)
 
             # We assume that these (unresolved) points are where the land->sea
             # transition occurs. We can raise them above sea level to model
             # coastline migration.
-            # FIXME: we don't do this because diffusion might push random points above sea level; for now we just leave the deposition point undersea
-            # FIXME: somehow we need to mark the land->sea transition flows and use that to decide which nodes can raise above sea level
-            # FIXME: also note that this introduces a dependency on the number of iterations; more iterations means more nodes above sea level, which doesn't make any physical sense
-            max_elev = sea  # normally we only raise this node to exactly sea level
-            # TODO
-            # if fill_undersea_catchment:  # if we're overfilling, it can go as high as the next highest neighbour
-            #     max_elev = 
-            volume = raise_node(nid=unresolved_id, max_elev=sea, max_volume=dv)
-            dv -= volume
+            # Diffusion might try to push isolated points above the sea level,
+            # but if there's no next-highest neighbour, we stay under sea.
+
+            # What's the next highest neighbour?
+            nids = self._get_pythonic_neighbours(unresolved_id, neighbours)
+            nelevs = elev[nids]
+            # discard elevs which are below the current node
+            nelevs = nelevs[nelevs > unresolved_elev]
+
+            if len(nelevs) > 0:
+                # there's a higher neighbour, so we can raise this node (at
+                # least to sea level)
+                max_elev = max(numpy.min(nelevs) - 0.0001, sea)
+                volume = raise_node(nid=unresolved_id, max_elev=max_elev, max_volume=dv)
+                dv -= volume
 
             # to prevent loops, we don't visit the same node twice
             seen_ids = set([unresolved_id])
-
             donor_ids = [unresolved_id]
 
             # Each iteration of this loop represents one more node traversal
@@ -1074,7 +1083,6 @@ class flowNetwork:
             # Sometimes we get trivially small (1e-10) volume of sediment that
             # is difficult to deposit; the threshold reduces the chance that
             # we will waste time searching for a destination
-
             while dv > 0.1:
                 # on this iteration, this is the list of ids that we can deposit to
                 receiver_ids = set()
@@ -1082,12 +1090,13 @@ class flowNetwork:
                 # maximum elev for this iteration is the worse-case elev of all donor nodes
                 # TODO: slightly more optimistic would be, for each receiver node, to take the minimum of the connected donor nodes, not all nodes in the iteration
                 iteration_elev = numpy.min(elev[list(donor_ids)])
-                if fill_undersea_catchment:
-                    iteration_elev = sea
+                iteration_elev = min(sea - 0.0001, iteration_elev)  # receivers can't come above sea level until catchment is full
                 # print '\titer up to %s' % iteration_elev
 
-                # find all of the potential donors
-                # we can deposit to a node which is downslope
+                # find all of the potential receivers
+                # we're depositing to anything underwater; this is simpler and works out roughly the same
+                # NOT we can deposit to a node which is downslope
+                # TODO: we should probably only go downhill
                 for did in donor_ids:
                     potential_ids = self._get_pythonic_neighbours(did, neighbours)
                     potential_elevs = elev[potential_ids]
@@ -1095,46 +1104,61 @@ class flowNetwork:
                     # NOTE: we're just diffusing to anything that is undersea without regard for the slope underneath
                     downslope_ids = potential_ids[potential_elevs < sea]
 
-                    # print 'did %s potential ids are %s, their elevs are %s, iter elev %s, we filtered to %s' % (did, potential_ids, potential_elevs, iteration_elev, downslope_ids)
-
-                    # import ipdb; ipdb.set_trace()
-
                     # store any nodes that we haven't already seen
                     for nid in downslope_ids:
                         if nid not in seen_ids:
                             receiver_ids.add(nid)
                             seen_ids.add(nid)
 
+                            # We track the maximum distance from deposition point to receiver. If the catchment fills, we use this to determine the land slope.
+                            dist = numpy.sqrt(numpy.sum(numpy.power(self.xycoords[nid] - self.xycoords[unresolved_id], 2)))
+                            max_distance = max(max_distance, dist)
+                            max_distance_id = nid
+
                 if len(receiver_ids) == 0:
-                    if fill_undersea_catchment is False:
-                        # If we exhaust the whole catchment, we start filling to above sea level
-                        # We set the fill_undersea_catchment flag and repeat the process
-                        print 'WARNING: filling undersea catchment (dv = %s)' % dv
-                        fill_undersea_catchment = True
-                        # reset
-                        seen_ids = set([unresolved_id])
-                        donor_ids = [unresolved_id]
-                        continue
+                    # The undersea part of this catchment is full. We fill the
+                    # nodes to above sea level and then leave the excess for
+                    # the land depo algorithm to worry about.
+
+                    # Technically, this can push catchment nodes above their
+                    # neighbours - but this is unlikely to matter as the slope
+                    # is so slight
+
+                    # We create a slope between the deposition point and the most distant point
+                    dh = elev[unresolved_id] - sea
+                    assert dh >= 0.0, 'dh = %s' % dh
+                    if len(seen_ids) > 1:
+                        assert max_distance > 0.0, 'max_distance = %s' % max_distance
+
+                        for nid in seen_ids:
+                            dist = numpy.sqrt(numpy.sum(numpy.power(self.xycoords[nid] - self.xycoords[unresolved_id], 2)))
+                            frac = dist / max_distance
+
+                            assert dist <= max_distance
+
+                            new_elev = sea + (1 - frac) * dh
+
+                            volume = raise_node(nid=nid, max_elev=new_elev, max_volume=dv)
+                            dv -= volume
+                            if dv <= 0.0:
+                                break
                     else:
-                        # The catchment is full. All we can do now is kick the
-                        # excess back to the land sediment algorithm
-                        # import ipdb; ipdb.set_trace()
-                        # assert False, 'too much'
-                        print "WARNING: filled undersea catchment. Need to bounce this back to land algo. (dv = %s)" % dv
-                        # potentially, you could call it directly at this stage; make sure any undersea changes that *it* makes are handled
+                        assert elev[unresolved_id] >= sea
 
-                        # you need to return this out of the function or keep the deposition_volume figures up to date
-                        # in the calling function you would then have a loop between land and sea, iterating until all deposition has been resolved
-                        dv = 0.0
-                        break
+                    # We've just filled the catchment with a slope from
+                    # unresolved_id to the furthest node. The furthest node is
+                    # the sink and therefore where we deposit.
+                    print 'NOTE: pushed above sea level (dv = %s)' % dv
+                    all_resolved = False
+                    assert elev[unresolved_id] >= sea
+                    assert max_distance_id is not None
+                    assert elev[int(max_distance_id)] >= sea
+                    deposition_volume[unresolved_id] = 0.0
+                    deposition_volume[max_distance_id] = dv
 
-
-                    # print "WARNING: ran out of places to deposit undersea (%s discarded)" % dv
-
-                    # TEMP: put a spike there so we can debug
-                    # elev[unresolved_id] = 10000.0
-                    # elev[list(receiver_ids)] = -100000.0
-                    # break
+                    dv = 0.0
+                    break
+                # else, assign sediment to the receivers
 
                 # TODO: we should be figuring out the exact amount to raise each node to correctly deposit the right amount of sediment
                 # we'd prefer to deposit evenly among the available receivers
@@ -1142,20 +1166,19 @@ class flowNetwork:
                 for nid in receiver_ids:
                     e = elev[nid]
                     new_elev = e + 0.95 * (iteration_elev - e)  # remember, raise_node won't lower a node
-                    if fill_undersea_catchment:
-                        new_elev = sea
-
                     volume = raise_node(nid=nid, max_elev=new_elev, max_volume=dv)
 
-                    # if volume == 0.0:
-                        # print '\t\tno depo; volume %s dv %s, raise node %s from %s to %s, max %s' % (volume, dv, nid, e, new_elev, iteration_elev)
                     dv -= volume
                     if dv <= 0.0:
                         break
 
-                # print '\titer complete; %s donors and %s receivers with dv %s' % (len(donor_ids), len(receiver_ids), dv)
                 # reset for next iteration
                 donor_ids = receiver_ids
+
+            if dv <= 0.1:
+                deposition_volume[unresolved_id] = 0.0
+
+        return all_resolved
 
     def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours):
         '''
@@ -1234,38 +1257,48 @@ class flowNetwork:
         # Note that pre_deposition_elev is before erosion, while elev is after. This is useful later for nodes that might transition from land->sea.
 
         # 2. APPLY LAND DEPOSITION
+        all_resolved = False
 
-        # The only land nodes with positive deposition should be sink nodes.
-        # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
-        deposition_volume = deposition_volume_rate * dt
-        land_sinks = list(numpy.where((deposition_volume > 0.0) & (pre_deposition_elev >= sea))[0])
+        while not all_resolved:
+            # The only land nodes with positive deposition should be sink nodes.
+            # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
+            deposition_volume = deposition_volume_rate * dt
+            land_sinks = list(numpy.where((deposition_volume > 0.0) & (pre_deposition_elev >= sea))[0])
 
-        # Track which sink_ids have been completely filled. This is used to prevent infinite loops where overfill bounces between two nodes.
-        filled_sinks = set()
+            # Track which sink_ids have been completely filled. This is used to prevent infinite loops where overfill bounces between two nodes.
+            filled_sinks = set()
 
-        for sink_id in land_sinks:
-            if sink_id in filled_sinks:
-                print 'WARNING: overfill loop; discarding volume %s' % deposition_volume[sink_id]
-                # TODO: you should try finding the next sill node and trying to pass the deposition down the hill
-                deposition_volume[sink_id] = 0.0
-                continue
+            print 'resolving %s land nodes' % len(land_sinks)
+            for sink_id in land_sinks:
+                if sink_id in filled_sinks:
+                    print 'WARNING: overfill loop; discarding volume %s' % deposition_volume[sink_id]
+                    # TODO: you should try finding the next sill node and trying to pass the deposition down the hill
+                    deposition_volume[sink_id] = 0.0
+                    continue
 
-            # We use the *after* erosion figure to calculate capacity
-            overfill_id, overfill_volume = self._distribute_sediment_land(sink_id, elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
+                # We use the *after* erosion figure to calculate capacity
+                overfill_id, overfill_volume = self._distribute_sediment_land(sink_id, elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
 
-            if overfill_id is not None:
-                # the sink must have filled, so add it to the filled list
-                filled_sinks.add(sink_id)
+                if overfill_id is not None:
+                    # the sink must have filled, so add it to the filled list
+                    filled_sinks.add(sink_id)
 
-                if elev[overfill_id] >= sea:
-                    # put at at the end of the land depo list - we deal with it in this loop
-                    # undersea deposition is dealt with in the next step
-                    land_sinks.append(overfill_id)
-                    deposition_volume[overfill_id] += overfill_volume
+                    if elev[overfill_id] >= sea:
+                        # put at at the end of the land depo list - we deal with it in this loop
+                        # undersea deposition is dealt with in the next step
+                        land_sinks.append(overfill_id)
+                        deposition_volume[overfill_id] += overfill_volume
 
-        # 2. APPLY SEA DEPOSITION
+            # 3. APPLY SEA DEPOSITION
+            print 'resolving %s sea nodes' % len(deposition_volume[deposition_volume > 0.0])
+            all_resolved = self._distribute_sediment_sea(elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
+            all_resolved = True
 
-        self._distribute_sediment_sea(elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
+            # TODO not sure how to integrate this with the land algo just yet
+            # TODO the land algo mustn't use the receiver network as it will be wrong now
+            if not all_resolved:
+                # TODO iterate through all unresolved nodes. If there are any, there's no guarantee that the deposition_volumes will be on the sink nodes (as required by the land depo algorithm), so move them there
+                pass
 
         elev_change = elev - starting_elev
 
