@@ -104,7 +104,7 @@ def streamflow(input, FVmesh, recGrid, force, hillslope, flow, elevation, \
     return fillH, elevation
 
 
-def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDisp, \
+def sediment_flux(input, recGrid, hillslope, FVmesh, lGIDs, tMesh, flow, force, applyDisp, \
                   mapero, cumdiff, fillH, disp, inGIDs, elevation, tNow, tEnd, verbose=False):
     """
     Compute sediment fluxes.
@@ -172,7 +172,8 @@ def sediment_flux(input, recGrid, hillslope, FVmesh, tMesh, flow, force, applyDi
     tmp = force.rivQs[ids]
     timestep, sedrate, diff = flow.compute_sedflux(FVmesh.control_volumes,
         elevation, fillH, xyMin, xyMax, diff_flux, input_timestep, force.rivQs,
-        force.sealevel, cumdiff, input.perc_dep, input.slp_cr, neighbours=tMesh.neighbours)
+        force.sealevel, cumdiff, input.perc_dep, input.slp_cr,
+        neighbours=tMesh.neighbours, FVmesh=FVmesh, globalIDs=lGIDs)
     if timestep < input_timestep:
         dt_reason = 'sedflux'
 

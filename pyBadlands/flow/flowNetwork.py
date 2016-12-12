@@ -332,7 +332,7 @@ class flowNetwork:
 
         return
 
-    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, rivqs, sealevel, cumdiff, perc_dep, slp_cr, neighbours=None):
+    def compute_sedflux(self, Acell, elev, fillH, xymin, xymax, diff_flux, dt, rivqs, sealevel, cumdiff, perc_dep, slp_cr, FVmesh, globalIDs, neighbours=None):
         """
         Calculates the sediment flux at each node.
 
@@ -428,7 +428,7 @@ class flowNetwork:
 
             # Stream power law
             elif self.spl:
-                diff, newdt = self._single_catchment_fill(areas=Acell, xymin=xymin, xymax=xymax, pre_elev=elev, max_dt=dt, sea=sealevel, diff_flux=diff_flux, neighbours=neighbours)
+                diff, newdt = self._single_catchment_fill(areas=Acell, xymin=xymin, xymax=xymax, pre_elev=elev, max_dt=dt, sea=sealevel, diff_flux=diff_flux, neighbours=neighbours, fillH=fillH, FVmesh=FVmesh, globalIDs=globalIDs)
                 sedflux = None
 
             # River carrying capacity case
@@ -1180,7 +1180,7 @@ class flowNetwork:
 
         return all_resolved
 
-    def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours):
+    def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours, fillH, FVmesh, globalIDs):
         '''
         Deposition algorithm as described at ...
 
@@ -1258,12 +1258,18 @@ class flowNetwork:
 
         # 2. APPLY LAND DEPOSITION
         all_resolved = False
+        first_pass = True
 
         while not all_resolved:
             # The only land nodes with positive deposition should be sink nodes.
             # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
             deposition_volume = deposition_volume_rate * dt
-            land_sinks = list(numpy.where((deposition_volume > 0.0) & (pre_deposition_elev >= sea))[0])
+
+            # TODO: try to remove the following fork, or justify its existence
+            if first_pass:
+                land_sinks = list(numpy.where((deposition_volume > 0.0) & (pre_deposition_elev >= sea))[0])
+            else:
+                land_sinks = list(numpy.where((deposition_volume > 0.0) & (elev >= sea))[0])
 
             # Track which sink_ids have been completely filled. This is used to prevent infinite loops where overfill bounces between two nodes.
             filled_sinks = set()
@@ -1292,13 +1298,26 @@ class flowNetwork:
             # 3. APPLY SEA DEPOSITION
             print 'resolving %s sea nodes' % len(deposition_volume[deposition_volume > 0.0])
             all_resolved = self._distribute_sediment_sea(elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
-            all_resolved = True
 
-            # TODO not sure how to integrate this with the land algo just yet
-            # TODO the land algo mustn't use the receiver network as it will be wrong now
             if not all_resolved:
-                # TODO iterate through all unresolved nodes. If there are any, there's no guarantee that the deposition_volumes will be on the sink nodes (as required by the land depo algorithm), so move them there
-                pass
+                # rebuild receiver network
+                # import ipdb; ipdb.set_trace()
+                self.SFD_receivers(fillH, elev, neighbours, FVmesh.vor_edges, FVmesh.edge_length, globalIDs, sea)
+
+                # invalidate cached sinks; they are probably wrong now
+                sinks.fill(-1)
+
+                # The land depo algorithm expects deposition to be at the sink
+                # node. Push any land depositions down to the sink.
+                ids = numpy.where((deposition_volume > 0.0) & (elev >= sea))[0]
+                for nid_array in numpy.nditer(ids, flags=('zerosize_ok',)):
+                    nid = int(nid_array)
+                    sink_id = self._resolve_sink(sinks, nid, elev, sea)
+                    vol = deposition_volume[nid]
+                    deposition_volume[sink_id] += vol
+                    deposition_volume[nid] -= vol
+
+                first_pass = False
 
         elev_change = elev - starting_elev
 

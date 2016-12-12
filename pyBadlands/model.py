@@ -307,7 +307,7 @@ class Model(object):
                         tEnd, self.force.next_disp, self.force.next_rain])
 
             # Compute sediment transport up to tStop
-            self.tNow, self.elevation, self.cumdiff = buildFlux.sediment_flux(self.input, self.recGrid, self.hillslope, self.FVmesh,
+            self.tNow, self.elevation, self.cumdiff = buildFlux.sediment_flux(self.input, self.recGrid, self.hillslope, self.FVmesh, self.lGIDs,
                               self.tMesh, self.flow, self.force, self.applyDisp, self.mapero, self.cumdiff, \
                               self.fillH, self.disp, self.inGIDs, self.elevation, self.tNow, tStop, verbose)
 
