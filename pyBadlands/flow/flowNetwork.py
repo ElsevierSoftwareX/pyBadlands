@@ -806,6 +806,8 @@ class flowNetwork:
         unvisited_ids = set([sink_id])
         dv = deposition_volume[sink_id]
 
+        assert dv > 0.0
+
         # Create a new sinks array which is local to this deposition action. We deform the TIN as we go, so it's not safe to reuse across depositions.
         sinks = numpy.empty(elev.shape, dtype=int)
         sinks.fill(-1)
@@ -924,21 +926,9 @@ class flowNetwork:
             newh = (dv - numpy.sum(ri_areas * ri_offset) + numpy.sum(ri_areas * ri_elevs)) / numpy.sum(ri_areas)
 
             if newh > (maxh - epsilon):
-                print 'WARNING: overfill; newh was %s max %s' % (newh, maxh)
+                print '\toverfill; newh was %s max %s' % (newh, maxh)
+                # we're going to overfill
                 newh = maxh - epsilon
-
-                # we're going to overfill to another catchment
-                # we know the sill node
-                # what is the sill node's sink? that's where the surplus will end up
-
-                # assert sill_id is not None
-                if sill_id is None:
-                    print 'WARNING: discarded overfill of volume %s' % '???'
-                else:
-                    overfill_sink_id = self._resolve_sink(sinks, sill_id, elev, sea)
-                    assert overfill_sink_id is not None
-                    print 'overflow to dest %s sill id %s' % (overfill_sink_id, sill_id)
-                    print "OVERFILL - doesn't look fully implemented"
 
             ri_new_elev = newh + ri_offset
 
@@ -961,11 +951,44 @@ class flowNetwork:
             # DEBUG ONLY: check that we allocated exactly what we expect
             assert dchange.shape == ri_areas.shape
             allocated_volume = numpy.sum(dchange * ri_areas)
+
             # FIXME: there are still differences between the catchment volume calculation and the final assignment
             depo_error = allocated_volume - dv
 
+            if depo_error > 0.1:
+                # We SHOULD have a sill because we've previously determined that
+                # there is enough capacity in this catchment; if we hadn't, we
+                # would have explored until we found a sill
+
+                # TODO we shouldn't be doing this
+                if sill_id is None:
+                    print '\tWARNING: depo_error of %s' % depo_error
+                else:
+                    overfill_id = self._resolve_sink(sinks, sill_id, elev, sea)
+                    assert depo_error > 0.0
+                    overfill_volume = depo_error
+                    depo_error = 0.0
+                    print '\toverflow %s to sink id %s sill id %s' % (overfill_volume, overfill_id, sill_id)
+            elif depo_error > -0.1:
+                depo_error = 0.0
+
+            if depo_error != 0.0:
+                print 'depo error %s' % depo_error
+            # assert not depo_error < 0.0, 'de %s' % depo_error
+
+
+
+            # print 'dep vol si %s reduce by %s' % (deposition_volume[sink_id], dv)
+            deposition_volume[sink_id] -= allocated_volume
+            if abs(deposition_volume[sink_id]) < 0.01:
+                deposition_volume[sink_id] = 0.0  # floating point error sometimes persists, and we use this is a yes/no there is work to do flag
+
+            if deposition_volume[sink_id] < 0.0:
+                print '\tWARNING: over-deposited node %s by %s' % (sink_id, -deposition_volume[sink_id])
+                deposition_volume[sink_id] = 0.0
+
             if abs(depo_error) > 0.01:
-                print 'WARNING: land discard allocated %s, total %s' % (allocated_volume, dv)
+                print '\tWARNING: land discard allocated %s, total %s' % (allocated_volume, dv)
 
         return overfill_id, overfill_volume
 
@@ -1127,11 +1150,21 @@ class flowNetwork:
                     # We create a slope between the deposition point and the most distant point
                     dh = elev[unresolved_id] - sea
                     assert dh >= 0.0, 'dh = %s' % dh
+
+                    # Track the furthest-away node that will raised. If there is excess deposition, this is where it goes.
+                    furthest_filled_id = unresolved_id
+                    furthest_filled_dist = 0.0
+
                     if len(seen_ids) > 1:
                         assert max_distance > 0.0, 'max_distance = %s' % max_distance
 
                         for nid in seen_ids:
                             dist = numpy.sqrt(numpy.sum(numpy.power(self.xycoords[nid] - self.xycoords[unresolved_id], 2)))
+
+                            if dist > furthest_filled_dist:
+                                furthest_filled_id = nid
+                                furthest_filled_dist = dist
+
                             frac = dist / max_distance
 
                             assert dist <= max_distance
@@ -1151,10 +1184,15 @@ class flowNetwork:
                     print 'NOTE: pushed above sea level (dv = %s)' % dv
                     all_resolved = False
                     assert elev[unresolved_id] >= sea
-                    assert max_distance_id is not None
-                    assert elev[int(max_distance_id)] >= sea
+
+                    # tolerate a little floating point error
+                    if elev[int(max_distance_id)] < (sea - 0.01):
+                        print ' TEST CASE dv is %s' % dv
+                        import ipdb; ipdb.set_trace()
+
+                    assert elev[furthest_filled_id] >= sea, 'sea is %s, elev is %s' % (sea, elev[furthest_filled_id])
                     deposition_volume[unresolved_id] = 0.0
-                    deposition_volume[max_distance_id] = dv
+                    deposition_volume[furthest_filled_id] = dv
 
                     dv = 0.0
                     break
@@ -1178,6 +1216,7 @@ class flowNetwork:
             if dv <= 0.1:
                 deposition_volume[unresolved_id] = 0.0
 
+        print 'at end, %s sea unresolved' % numpy.sum(deposition_volume != 0.0)
         return all_resolved
 
     def _single_catchment_fill(self, pre_elev, xymin, xymax, max_dt, sea, areas, diff_flux, neighbours, fillH, FVmesh, globalIDs):
@@ -1260,6 +1299,8 @@ class flowNetwork:
         all_resolved = False
         first_pass = True
 
+        print '*** START LOOP'
+
         while not all_resolved:
             # The only land nodes with positive deposition should be sink nodes.
             # Note that we use the pre-erosion elevation as there might be enough deposition to keep a node above sea level.
@@ -1276,10 +1317,30 @@ class flowNetwork:
 
             print 'resolving %s land nodes' % len(land_sinks)
             for sink_id in land_sinks:
+                '''
                 if sink_id in filled_sinks:
                     print 'WARNING: overfill loop; discarding volume %s' % deposition_volume[sink_id]
                     # TODO: you should try finding the next sill node and trying to pass the deposition down the hill
                     deposition_volume[sink_id] = 0.0
+                    continue
+                '''
+
+                assert elev[sink_id] >= sea
+
+                # It's possible that other deposition can change the flow network, so we check to make sure this is still the sink.
+                # Instead of looping again, we just change this loop invocation to deal with it right here.
+                # FIXME: but this caches results! how do you prevent caching?
+                actual_sink_id = int(self._resolve_sink(sinks, sink_id, elev, sea))
+                if actual_sink_id != sink_id:
+                    # The sink has moved. Rather than going back to handle it later, let's just deal with it now
+                    vol = deposition_volume[sink_id]
+                    deposition_volume[sink_id] = 0.0
+                    deposition_volume[actual_sink_id] += vol
+                    # print 'sink moved %s %s' % (sink_id, actual_sink_id)
+                    sink_id = actual_sink_id
+
+                if deposition_volume[sink_id] == 0.0:
+                    print 'zero dv?'
                     continue
 
                 # We use the *after* erosion figure to calculate capacity
@@ -1299,9 +1360,11 @@ class flowNetwork:
             print 'resolving %s sea nodes' % len(deposition_volume[deposition_volume > 0.0])
             all_resolved = self._distribute_sediment_sea(elev=elev, deposition_volume=deposition_volume, areas=areas, neighbours=neighbours, sea=sea)
 
+            print 'after, all_resolved = %s, %s unresolved' % (all_resolved, numpy.sum(deposition_volume != 0.0))
+            # import ipdb; ipdb.set_trace()
+
             if not all_resolved:
                 # rebuild receiver network
-                # import ipdb; ipdb.set_trace()
                 self.SFD_receivers(fillH, elev, neighbours, FVmesh.vor_edges, FVmesh.edge_length, globalIDs, sea)
 
                 # invalidate cached sinks; they are probably wrong now
@@ -1321,6 +1384,7 @@ class flowNetwork:
 
         elev_change = elev - starting_elev
 
+        print '*** EXIT LOOP'
         # No erosion or deposition on the borders
         # elev_change[border_flags] = 0.0
 
